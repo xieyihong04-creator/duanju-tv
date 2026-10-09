@@ -56,4 +56,4 @@ jobs:
           APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
           gh release create "$TAG" "$APK" \
             --title "$TAG" \
-            --notes "红果完整版（App签名通道+网页兜底）+ 设置页切换红果源"
+            --notes "红果通道修复版：App 游标分页 + 详情分集水合 + 永久失败熔断（30min 冷却走网页通道）+ 网页搜索修复 + 收藏/历史/下载 key 统一"
