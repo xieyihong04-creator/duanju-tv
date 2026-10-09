@@ -5,6 +5,12 @@ import com.duanju.tv.data.model.PlayGroup
 import com.duanju.tv.data.remote.HongguoAppClient
 import com.duanju.tv.data.remote.LandpageCursor
 import com.duanju.tv.data.remote.HongguoSign
+import com.duanju.tv.data.remote.parseVideoModel
+import com.duanju.tv.data.remote.selectClearStream
+import com.duanju.tv.data.remote.getJsonArray
+import com.duanju.tv.data.remote.getJsonObject
+import com.duanju.tv.data.remote.strOrNull
+import com.duanju.tv.data.remote.toList
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -222,6 +228,272 @@ class HongguoAppClientTest {
         assertTrue(gorgon.startsWith("8404401c0000"))
         assertEquals(fixedTs.toString(), khronos)
     }
+
+    // ========== 4. 选流纯函数测试 ==========
+
+    @Test
+    fun testSelectClearStream_picksHighestQualityH264() {
+        // 伪造 video_list：包含多个清晰度、编码的明流
+        val videoList = JsonArray(listOf(
+            // 720p h264 (score = 720*10 + 1 = 7201)
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("720"),
+                    "vwidth" to JsonPrimitive("1280"),
+                    "definition" to JsonPrimitive("720p"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/720p_h264.m3u8"),
+            )),
+            // 1080p hevc (score = 1080*10 = 10800)
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("hevc"),
+                    "vheight" to JsonPrimitive("1080"),
+                    "vwidth" to JsonPrimitive("1920"),
+                    "definition" to JsonPrimitive("1080p"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/1080p_hevc.m3u8"),
+            )),
+            // 480p h264 (score = 480*10 + 1 = 4801)
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("avc1"),
+                    "vheight" to JsonPrimitive("480"),
+                    "vwidth" to JsonPrimitive("854"),
+                    "definition" to JsonPrimitive("480p"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/480p_h264.m3u8"),
+            )),
+        ))
+
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNotNull("应选出最高分流", selected)
+        assertEquals("应选 1080p hevc（分最高）", "https://example.com/1080p_hevc.m3u8", selected)
+    }
+
+    @Test
+    fun testSelectClearStream_skipsBytevc2() {
+        val videoList = JsonArray(listOf(
+            // bytevc2 编码应被跳过
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("bytevc2"),
+                    "vheight" to JsonPrimitive("1080"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/bytevc2.m3u8"),
+            )),
+            // 正常 h264
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("720"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/normal.m3u8"),
+            )),
+        ))
+
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNotNull(selected)
+        assertEquals("应跳过 bytevc2，选正常流", "https://example.com/normal.m3u8", selected)
+    }
+
+    @Test
+    fun testSelectClearStream_skipsEncryptedVariants() {
+        val videoList = JsonArray(listOf(
+            // 有 spade_a 的加密流
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("1080"),
+                )),
+                "encrypt_info" to JsonObject(mapOf(
+                    "spade_a" to JsonPrimitive("encrypted_key_data"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/encrypted.m3u8"),
+            )),
+            // encrypt=true 的加密流
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("720"),
+                )),
+                "encrypt_info" to JsonObject(mapOf(
+                    "encrypt" to JsonPrimitive("true"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/encrypted2.m3u8"),
+            )),
+            // encryption_method=cenc-aes-ctr 的加密流
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("480"),
+                )),
+                "encrypt_info" to JsonObject(mapOf(
+                    "encryption_method" to JsonPrimitive("cenc-aes-ctr"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/encrypted3.m3u8"),
+            )),
+            // 明流
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("720"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/clear.m3u8"),
+            )),
+        ))
+
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNotNull(selected)
+        assertEquals("应跳过所有加密变体，选明流", "https://example.com/clear.m3u8", selected)
+    }
+
+    @Test
+    fun testSelectClearStream_skipsGearDesKeyBytevc2() {
+        val videoList = JsonArray(listOf(
+            // gear_des_key 含 bytevc2 应被跳过
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("1080"),
+                )),
+                "gear_des_key" to JsonPrimitive("bytevc2_key_data"),
+                "main_url" to JsonPrimitive("https://example.com/gear_bytevc2.m3u8"),
+            )),
+            // 正常流
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("720"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/normal.m3u8"),
+            )),
+        ))
+
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNotNull(selected)
+        assertEquals("应跳过 gear_des_key 含 bytevc2", "https://example.com/normal.m3u8", selected)
+    }
+
+    @Test
+    fun testSelectClearStream_noClearStream_returnsNull() {
+        val videoList = JsonArray(listOf(
+            // 全是加密流
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("1080"),
+                )),
+                "encrypt_info" to JsonObject(mapOf(
+                    "spade_a" to JsonPrimitive("key"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/encrypted.m3u8"),
+            )),
+            // 全是 bytevc2
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("bytevc2"),
+                    "vheight" to JsonPrimitive("720"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/bytevc2.m3u8"),
+            )),
+        ))
+
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNull("无明流时应返回 null", selected)
+    }
+
+    @Test
+    fun testSelectClearStream_emptyList_returnsNull() {
+        val videoList = JsonArray(emptyList())
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNull("空列表应返回 null", selected)
+    }
+
+    @Test
+    fun testSelectClearStream_usesBackupUrls() {
+        // main_url 为空，backup_url 有值
+        val videoList = JsonArray(listOf(
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("720"),
+                )),
+                "main_url" to JsonPrimitive(""),
+                "backup_url" to JsonPrimitive("https://example.com/backup.m3u8"),
+            )),
+        ))
+
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNotNull(selected)
+        assertEquals("应使用 backup_url", "https://example.com/backup.m3u8", selected)
+    }
+
+    @Test
+    fun testSelectClearStream_usesDefinitionOverVheight() {
+        // definition 优先于 vheight
+        val videoList = JsonArray(listOf(
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("720"),
+                    "definition" to JsonPrimitive("1080p"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/def_1080.m3u8"),
+            )),
+            JsonObject(mapOf(
+                "video_meta" to JsonObject(mapOf(
+                    "codec_type" to JsonPrimitive("h264"),
+                    "vheight" to JsonPrimitive("1080"),
+                    "definition" to JsonPrimitive("720p"),
+                )),
+                "main_url" to JsonPrimitive("https://example.com/vheight_1080.m3u8"),
+            )),
+        ))
+
+        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
+        assertNotNull(selected)
+        assertEquals("应优先使用 definition", "https://example.com/def_1080.m3u8", selected)
+    }
+
+    @Test
+    fun testParseVideoModel_object() {
+        val data = JsonObject(mapOf(
+            "video_model" to JsonObject(mapOf(
+                "video_list" to JsonArray(listOf(
+                    JsonObject(mapOf("main_url" to JsonPrimitive("https://example.com/test.m3u8"))),
+                )),
+            )),
+        ))
+
+        val model = HongguoAppClientTestAccessor.parseVideoModelTest(data)
+        assertNotNull(model)
+        assertNotNull(model!!.getJsonArray("video_list"))
+    }
+
+    @Test
+    fun testParseVideoModel_jsonString() {
+        val innerJson = """{"video_list":[{"main_url":"https://example.com/from_string.m3u8"}]}"""
+        val data = JsonObject(mapOf(
+            "video_model" to JsonPrimitive(innerJson),
+        ))
+
+        val model = HongguoAppClientTestAccessor.parseVideoModelTest(data)
+        assertNotNull(model)
+        val list = model!!.getJsonArray("video_list")!!
+        assertEquals(1, list.size)
+    }
+
+    @Test
+    fun testParseVideoModel_missing_returnsNull() {
+        val data = JsonObject(mapOf(
+            "other_field" to JsonPrimitive("value"),
+        ))
+
+        val model = HongguoAppClientTestAccessor.parseVideoModelTest(data)
+        assertNull(model)
+    }
 }
 
 /**
@@ -348,5 +620,15 @@ object HongguoAppClientTestAccessor {
         val p = this[key] as? kotlinx.serialization.json.JsonPrimitive ?: return null
         val content = p.content
         return if (content == "null") null else content.takeIf { it.isNotBlank() }
+    }
+
+    /** 选流纯函数（委托给顶层 selectClearStream） */
+    fun selectClearStreamTest(videoList: JsonArray): String? {
+        return selectClearStream(videoList)
+    }
+
+    /** 解析 video_model（委托给顶层 parseVideoModel） */
+    fun parseVideoModelTest(data: JsonObject): JsonObject? {
+        return parseVideoModel(data)
     }
 }

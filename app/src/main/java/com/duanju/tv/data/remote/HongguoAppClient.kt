@@ -3,6 +3,7 @@ package com.duanju.tv.data.remote
 import com.duanju.tv.data.model.Drama
 import com.duanju.tv.data.model.Episode
 import com.duanju.tv.data.model.PlayGroup
+import com.duanju.tv.data.model.Resolved
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -24,6 +25,7 @@ import java.util.concurrent.TimeUnit
  * 对应 Go: /tmp/opencode/guoapp/native/core/provider_hongguo_app.go (hongguoAppRequest)
  *         /tmp/opencode/guoapp/native/core/provider_hongguo_catalog.go (landpage)
  *         /tmp/opencode/guoapp/native/core/provider_hongguo_detail.go (video_detail)
+ *         /tmp/opencode/guoapp/native/core/provider_hongguo_native_media.go (video_model)
  *
  * 签名复用 HongguoSign.sign/stub，不重写签名逻辑。
  */
@@ -64,6 +66,7 @@ class HongguoAppClient(
     companion object {
         const val LAND_PAGE_PATH = "/reading/distribution/category/landpage/v/"
         const val VIDEO_DETAIL_PATH = "/novel/player/video_detail/v1/"
+        const val VIDEO_MODEL_PATH = "/novel/player/video_model/v1/"
         const val MAX_RETRIES = 3
         const val TIMEOUT_SECONDS = 20L
     }
@@ -207,6 +210,44 @@ class HongguoAppClient(
             playGroups = listOf(playGroup),
             backendId = seriesId,
         )
+    }
+
+    /**
+     * 取流：POST /novel/player/video_model/v1/
+     *
+     * @param seriesId 剧集 ID (series_id)
+     * @param vid 视频 ID
+     * @return Resolved.Direct 含明流 URL 与请求头
+     * @throws IOException 无明流或请求失败
+     */
+    suspend fun videoModel(seriesId: String, vid: String): Resolved.Direct = withContext(Dispatchers.IO) {
+        if (!seriesId.matches(Regex("^\\d+$")) || !vid.matches(Regex("^\\d+$"))) {
+            throw IOException("红果剧集/视频 ID 无效: seriesId=$seriesId, vid=$vid")
+        }
+
+        val payload = json.encodeToString(mapOf(
+            "video_id" to vid,
+            "content_type" to 1,
+            "biz_param" to mapOf(
+                "need_all_video_definition" to true,
+                "video_platform" to 3,
+            ),
+        ))
+        val (response, _) = postWithSign(VIDEO_MODEL_PATH, payload)
+
+        val data = response.getJsonObject("data") ?: throw IOException("video_model 响应缺少 data")
+        val videoModel = parseVideoModel(data) ?: throw IOException("video_model 响应缺少 video_model")
+
+        val videoList = videoModel.getJsonArray("video_list") ?: throw IOException("video_model 缺少 video_list")
+        val clearUrl = selectClearStream(videoList)
+            ?: throw IOException("红果 App 未返回兼容的明流，已跳过加密/不支持编码")
+
+        val headers = mapOf(
+            "User-Agent" to userAgent,
+            "Referer" to "https://hongguoduanju.com/",
+            "Origin" to "https://hongguoduanju.com",
+        )
+        return@withContext Resolved.Direct(clearUrl, headers)
     }
 
     // ========== 内部方法 ==========
@@ -390,28 +431,8 @@ class HongguoAppClient(
                 emptyList()
             }
             else -> emptyList()
-        }
-    }
-
-    // ========== 扩展函数 ==========
-
-    private fun JsonObject.getJsonObject(key: String): JsonObject? = this[key] as? JsonObject
-
-    private fun JsonObject.getJsonArray(key: String): JsonArray? = this[key] as? JsonArray
-
-    private fun JsonObject.strOrNull(key: String): String? {
-        val p = this[key] as? JsonPrimitive ?: return null
-        val content = p.content
-        return if (content == "null") null else content.takeIf { it.isNotBlank() }
-    }
-
-    private fun JsonArray.toList(): List<JsonElement> = (0 until size).map { get(it) }
-
-    private fun Map<String, String>.toHeaders(): okhttp3.Headers {
-        return okhttp3.Headers.Builder().apply {
-            for ((k, v) in this@toHeaders) add(k, v)
-        }.build()
-    }
+}
+}
 }
 
 /** landpage 分页游标（对应 Go hongguoCatalogCursor） */
@@ -424,3 +445,160 @@ data class LandpageCursor(
     val initialized: Boolean = false,
     val exhausted: Boolean = false,
 )
+
+/** 解析 video_model 响应，支持直接对象或 JSON 字符串（对应 Go provider_hongguo_native_media.go:27-35） */
+fun parseVideoModel(data: JsonObject): JsonObject? {
+    val videoModelElement = data["video_model"]
+    return when (videoModelElement) {
+        is JsonObject -> videoModelElement
+        is JsonPrimitive -> {
+            val str = videoModelElement.content
+            if (str.isNotBlank() && str != "null") {
+                try {
+                    Json { ignoreUnknownKeys = true; isLenient = true }.parseToJsonElement(str) as? JsonObject
+                } catch (_: Exception) {
+                    null
+                }
+            } else null
+        }
+        else -> null
+    }
+}
+
+/**
+ * 选流：从 video_list 中选择最高质量的明流（对应 Go selectHongguoAppMedia/hongguoMediaAddresses）
+ * MVP 只返回明流，跳过加密变体、bytevc2 编码
+ *
+ * @return 明流 URL，无可用明流返回 null
+ */
+fun selectClearStream(videoList: JsonArray): String? {
+    var bestUrl: String? = null
+    var bestScore = -1
+
+    for (item in videoList.toList()) {
+        val variant = item as? JsonObject ?: continue
+
+        // 跳过 bytevc2 编码（对应 Go: codec == "bytevc2" 或 gear_des_key 含 bytevc2）
+        val meta = variant.getJsonObject("video_meta") ?: continue
+        val codec = meta.strOrNull("codec_type")?.lowercase() ?: ""
+        if (codec == "bytevc2") continue
+        val gearDesKey = variant.strOrNull("gear_des_key")?.lowercase() ?: ""
+        if (gearDesKey.contains("bytevc2")) continue
+
+        // 跳过加密变体（对应 Go: encrypt_info.spade_a 或 encrypt=true 或 encryption_method=cenc-aes-ctr）
+        val encryptInfo = variant.getJsonObject("encrypt_info")
+        if (encryptInfo != null) {
+            val spadeA = encryptInfo.strOrNull("spade_a") ?: ""
+            val encrypt = encryptInfo["encrypt"]?.let { (it as JsonPrimitive).content.toBoolean() } ?: false
+            val encryptionMethod = encryptInfo.strOrNull("encryption_method") ?: ""
+            if (spadeA.isNotBlank() || encrypt || encryptionMethod == "cenc-aes-ctr") {
+                continue // MVP 只处理明流
+            }
+        }
+
+        // 提取地址（对应 Go hongguoMediaAddresses: main_url, backup_url, backup_url_1, backup_url_2, backup_urls, url_list）
+        val addresses = extractMediaAddresses(variant)
+        if (addresses.isEmpty()) continue
+
+        // 计算质量分（对应 Go: height * 10 + (h264/avc1 ? 1 : 0)）
+        val height = meta.strOrNull("vheight")?.toIntOrNull() ?: 0
+        val definitionStr = meta.strOrNull("definition") ?: ""
+        val definition = Regex("[0-9]+").find(definitionStr)?.value?.toIntOrNull() ?: 0
+        val effectiveHeight = if (definition > 0) definition else height
+        val width = meta.strOrNull("vwidth")?.toIntOrNull() ?: 0
+        val finalHeight = if (effectiveHeight > 0) effectiveHeight else if (width > 0) width else 0
+
+        var score = finalHeight * 10
+        if (codec == "h264" || codec == "avc1") score++
+
+        for (url in addresses) {
+            if (score > bestScore) {
+                bestScore = score
+                bestUrl = url
+            }
+        }
+    }
+
+    return bestUrl
+}
+
+/** 从 variant 中提取媒体地址（对应 Go hongguoMediaAddresses） */
+private fun extractMediaAddresses(variant: JsonObject): List<String> {
+    val addresses = mutableListOf<String>()
+    val seen = mutableSetOf<String>()
+
+    fun addAddress(value: JsonElement?) {
+        when (value) {
+            is JsonPrimitive -> {
+                val str = value.content.trim()
+                if (str.isNotEmpty() && str.length <= 8192) {
+                    val url = if (isHttpMediaUrl(str)) str else decodeBase64IfNeeded(str)
+                    if (isHttpMediaUrl(url) && seen.add(url)) addresses.add(url)
+                }
+            }
+            is JsonArray -> value.forEach { addAddress(it) }
+            else -> {}
+        }
+    }
+
+    for (key in listOf("main_url", "backup_url", "backup_url_1", "backup_url_2", "backup_urls", "url_list")) {
+        addAddress(variant[key])
+    }
+    return addresses
+}
+
+/** 判断是否为 HTTP 媒体 URL */
+private fun isHttpMediaUrl(url: String): Boolean {
+    return url.startsWith("http://") || url.startsWith("https://")
+}
+
+/** 尝试 Base64 解码（对应 Go decodeHongguoBase64：先标准、再无填充；失败返回原文由调用方过滤）
+ *  纯 Kotlin 实现：不依赖 android.util.Base64（纯 JVM 单测无此 API）也不依赖 java.util.Base64（需 API 26，minSdk 23 不可用）。 */
+private fun decodeBase64IfNeeded(str: String): String {
+    val bytes = decodeBase64Strict(str) ?: return str
+    return String(bytes, Charsets.UTF_8).trim()
+}
+
+private const val B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+/** 严格 Base64 解码：非法字符/`=`位置不对/长度非法返回 null；接受带填充与无填充两种形态。 */
+private fun decodeBase64Strict(s: String): ByteArray? {
+    var t = s.trim()
+    if (t.isEmpty() || t.length % 4 == 1) return null
+    t = t.padEnd(((t.length + 3) / 4) * 4, '=')
+    val pad = t.takeLastWhile { it == '=' }.length
+    if (pad > 2) return null
+    val body = t.dropLast(pad)
+    if (body.any { it !in B64_ALPHABET }) return null
+    val out = ByteArray(t.length / 4 * 3 - pad)
+    var o = 0
+    fun b64val(c: Char): Int = if (c == '=') 0 else B64_ALPHABET.indexOf(c)
+    for (i in t.indices step 4) {
+        val n = (b64val(t[i]) shl 18) or (b64val(t[i + 1]) shl 12) or
+            (b64val(t[i + 2]) shl 6) or b64val(t[i + 3])
+        out[o++] = (n shr 16).toByte()
+        if (o < out.size) out[o++] = (n shr 8).toByte()
+        if (o < out.size) out[o++] = n.toByte()
+    }
+    return out
+}
+
+// ========== 顶层扩展函数（供顶层函数使用） ==========
+
+fun JsonObject.getJsonObject(key: String): JsonObject? = this[key] as? JsonObject
+
+fun JsonObject.getJsonArray(key: String): JsonArray? = this[key] as? JsonArray
+
+fun JsonObject.strOrNull(key: String): String? {
+    val p = this[key] as? JsonPrimitive ?: return null
+    val content = p.content
+    return if (content == "null") null else content.takeIf { it.isNotBlank() }
+}
+
+fun JsonArray.toList(): List<JsonElement> = (0 until size).map { get(it) }
+
+fun Map<String, String>.toHeaders(): okhttp3.Headers {
+    return okhttp3.Headers.Builder().apply {
+        for ((k, v) in this@toHeaders) add(k, v)
+    }.build()
+}
