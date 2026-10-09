@@ -1,16 +1,16 @@
 package com.duanju.tv.data
 
-import com.duanju.tv.data.model.Drama
-import com.duanju.tv.data.model.PlayGroup
+import com.duanju.tv.data.model.entryKey
+import com.duanju.tv.data.media.DljDownloadManager
 import com.duanju.tv.data.remote.HongguoAppClient
-import com.duanju.tv.data.remote.LandpageCursor
 import com.duanju.tv.data.remote.HongguoSign
+import com.duanju.tv.data.remote.LandpageCursor
+import com.duanju.tv.data.remote.hongguoDramaFromItem
 import com.duanju.tv.data.remote.parseVideoModel
+import com.duanju.tv.data.remote.parseHongguoVidList
 import com.duanju.tv.data.remote.selectClearStream
 import com.duanju.tv.data.remote.getJsonArray
-import com.duanju.tv.data.remote.getJsonObject
-import com.duanju.tv.data.remote.strOrNull
-import com.duanju.tv.data.remote.toList
+import com.duanju.tv.data.remote.videoModelVariants
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -20,13 +20,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 /**
- * HongguoAppClient 纯函数单测
+ * 红果通道纯函数单测（不打网络）
  *
- * 测试范围：
- * 1. buildQueryParams / buildHeaders - 验证 query 参数完整、签名 header 齐全、X-Gorgon 长度 52
- * 2. parseLandpageCursor / parseLandpageItem - 验证游标解析与条目映射
+ * 覆盖：
+ * 1. 请求体必须是可序列化的 JsonObject（历史上用 Map<String, Any> 直接把 App 通道打死）
+ * 2. landpage 游标语义与分页签名
+ * 3. 条目 -> Drama 的字段映射（用真实抓包形态）
+ * 4. vid_list / video_list 两种分集形态
+ * 5. 选流：加密流、bytevc2 过滤，明流取最高分
+ * 6. key 一致性：Drama.key / 收藏键 / 下载任务 id 同构
  *
- * 不依赖网络、不依赖 MockWebServer，仅用 JUnit + kotlinx-serialization-json
+ * 签名本身在 HongguoSignTest 里有 Go 侧 golden 值，这里只做长度与 header 校验。
  */
 class HongguoAppClientTest {
 
@@ -35,78 +39,60 @@ class HongguoAppClientTest {
     private val fixedTs = 1700000000L
     private val fixedRticket = "1700000000000"
 
-    // ========== 1. Query/Header 纯函数测试 ==========
+    // ========== 1. 请求体序列化 ==========
 
     @Test
-    fun testBuildQueryParams_containsAllRequiredKeys() {
-        val query = HongguoAppClientTestAccessor.buildQueryParams(deviceId, fixedRticket)
+    fun `landpage payload serializes to JSON directly`() {
+        val client = newClient()
+        val payload = client.buildLandpagePayload(LandpageCursor(offset = 18, sessionId = "sess_1"))
 
-        // 必须包含的固定参数（对应 Go provider_hongguo_app.go:135-141）
-        val requiredKeys = listOf(
-            "aid", "app_name", "version_code", "version_name",
-            "manifest_version_code", "update_version_code", "channel",
-            "device_platform", "os", "ssmix", "device_type", "device_brand",
-            "language", "os_api", "os_version", "resolution", "dpi", "ac",
-            "device_id", "iid", "_rticket"
+        // kotlinx 对 Map<String, Any> 会抛 "Serializer for class 'Any' is not found"，
+        // 一旦这里退回 Map 形态，整个 App 通道的 POST 都会失败
+        val text = json.encodeToString(JsonElement.serializer(), payload)
+        assertTrue(text, text.contains("\"offset\":18"))
+        assertTrue(text, text.contains("\"session_id\":\"sess_1\""))
+        assertTrue(text, text.contains("\"client_req_type\":2"))
+        assertTrue(text, text.contains("\"limit\":18"))
+        assertTrue(text, text.contains("short_play"))
+    }
+
+    @Test
+    fun `landpage payload uses client_req_type 3 then 2`() {
+        val client = newClient()
+        assertEquals(
+            "3",
+            client.buildLandpagePayload(LandpageCursor()).getJsonPrimitive("client_req_type"),
         )
-        for (key in requiredKeys) {
-            assertTrue("query 必须包含 $key", query.containsKey(key))
-            assertTrue("query[$key] 不能为空", query[key]?.isNotBlank() == true)
-        }
-        assertEquals("device_id 应等于传入 deviceId", deviceId, query["device_id"])
-        assertEquals("iid 应等于 deviceId", deviceId, query["iid"])
-        assertEquals("_rticket 应等于固定毫秒值", fixedRticket, query["_rticket"])
-    }
-
-    @Test
-    fun testBuildHeaders_completeAndXGorgonLength52() {
-        val rawQuery = HongguoAppClientTestAccessor.buildQueryParams(deviceId, fixedRticket)
-            .entries.joinToString("&") { "${it.key}=${it.value}" }
-        val bodyBytes = """{"req_scene":"default","offset":0,"limit":18,"req_type":"only_content","need_selector_panel":false,"client_req_type":3,"session_id":"","filter_ids":"","select_items":{"genre":["short_play"],"sort":["online_time"],"gender":[],"category_dim_theme":[],"category_dim_role":[],"category_dim_epoch":[],"online_time":[],"creation_status":[]}}""".toByteArray()
-
-        val headers = HongguoAppClientTestAccessor.buildHeaders(rawQuery, bodyBytes, fixedTs)
-
-        // 必须包含的 header（对应 Go provider_hongguo_app.go:173-189, 197-198）
-        val requiredHeaders = listOf(
-            "User-Agent", "Accept", "X-XS-From-Web", "Sdk-Version",
-            "Content-Type", "X-Gorgon", "X-Khronos", "X-SS-Req-Ticket", "X-SS-STUB"
+        assertEquals(
+            "2",
+            client.buildLandpagePayload(LandpageCursor(offset = 18, sessionId = "s"))
+                .getJsonPrimitive("client_req_type"),
         )
-        for (h in requiredHeaders) {
-            assertTrue("header 必须包含 $h", headers.containsKey(h))
-            assertTrue("header[$h] 不能为空", headers[h]?.isNotBlank() == true)
-        }
+    }
 
-        // X-Gorgon 必须是 52 字符（26 字节 hex）
-        val xGorgon = headers["X-Gorgon"]!!
-        assertEquals("X-Gorgon 长度必须为 52", 52, xGorgon.length)
-        assertTrue("X-Gorgon 必须以 8404401c0000 开头", xGorgon.startsWith("8404401c0000"))
+    // ========== 2. 分页签名与游标 ==========
 
-        // X-Khronos 必须等于 timestamp 秒
-        assertEquals("X-Khronos 必须等于 timestamp", fixedTs.toString(), headers["X-Khronos"])
-
-        // X-SS-STUB 必须是大写 MD5（对应 Go fmt.Sprintf("%X", bodyHash)）
-        val stub = headers["X-SS-STUB"]!!
-        assertEquals("X-SS-STUB 必须是 32 字符大写 hex", 32, stub.length)
-        assertTrue("X-SS-STUB 必须全大写", stub.all { it.isUpperCase() || it.isDigit() })
+    @Test
+    fun `page signature is SHA-256 of sorted ids`() {
+        val client = newClient()
+        // 与 Go fmt.Sprintf("%x", sha256.Sum256(join(ids,"\n"))) 一致
+        assertEquals(
+            "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+            client.computePageSignature(listOf("1")),
+        )
+        // 排序后再签名：顺序不同结果相同，对应 "1\n2" 的摘要
+        val ab = client.computePageSignature(listOf("2", "1"))
+        val ba = client.computePageSignature(listOf("1", "2"))
+        assertEquals(ab, ba)
+        assertEquals(
+            "b598b3a62a3f7cedb17e66d1cb31d53dffeebaf5c07e2c60d5e31971936fd35e",
+            ab,
+        )
+        assertEquals("", client.computePageSignature(emptyList()))
     }
 
     @Test
-    fun testBuildHeaders_emptyBody_noStub() {
-        val rawQuery = HongguoAppClientTestAccessor.buildQueryParams(deviceId, fixedRticket)
-            .entries.joinToString("&") { "${it.key}=${it.value}" }
-        val bodyBytes = byteArrayOf()
-
-        val headers = HongguoAppClientTestAccessor.buildHeaders(rawQuery, bodyBytes, fixedTs)
-
-        // 空 body 时 X-SS-STUB 应为空字符串（对应 Go: body 为空不设置 X-SS-STUB，但我们设为空串）
-        val stub = headers["X-SS-STUB"]!!
-        assertEquals("空 body 时 X-SS-STUB 应为空", "", stub)
-    }
-
-    // ========== 2. 解析纯函数测试 ==========
-
-    @Test
-    fun testParseLandpageCursor_roundTrip() {
+    fun `cursor survives encode-decode round trip`() {
         val cursor = LandpageCursor(
             offset = 18,
             sessionId = "sess_abc123",
@@ -115,520 +101,416 @@ class HongguoAppClientTest {
             initialized = true,
             exhausted = false,
         )
-        val jsonStr = json.encodeToString(cursor)
-        val parsed = json.decodeFromString<LandpageCursor>(jsonStr)
-
-        assertEquals(cursor.offset, parsed.offset)
-        assertEquals(cursor.sessionId, parsed.sessionId)
-        assertEquals(cursor.lastId, parsed.lastId)
-        assertEquals(cursor.pageSignature, parsed.pageSignature)
-        assertEquals(cursor.initialized, parsed.initialized)
-        assertEquals(cursor.exhausted, parsed.exhausted)
+        val parsed = json.decodeFromString(LandpageCursor.serializer(), json.encodeToString(LandpageCursor.serializer(), cursor))
+        assertEquals(cursor, parsed)
+        assertEquals(
+            LandpageCursor(),
+            json.decodeFromString(LandpageCursor.serializer(), json.encodeToString(LandpageCursor.serializer(), LandpageCursor())),
+        )
     }
 
-    @Test
-    fun testParseLandpageCursor_emptyDefaults() {
-        val cursor = LandpageCursor()
-        val jsonStr = json.encodeToString(cursor)
-        val parsed = json.decodeFromString<LandpageCursor>(jsonStr)
+    // ========== 3. landpage 响应解析 ==========
 
-        assertEquals(0, parsed.offset)
-        assertEquals("", parsed.sessionId)
-        assertEquals("", parsed.lastId)
-        assertEquals("", parsed.pageSignature)
-        assertFalse(parsed.initialized)
-        assertFalse(parsed.exhausted)
-    }
-
-    @Test
-    fun testParseLandpageItem_mapsAllFields() {
-        // 伪造 landpage 单条响应（模拟 Go parseHongguoCatalogPage 返回结构）
-        val itemJson = JsonObject(mapOf(
-            "video_data" to JsonObject(mapOf(
-                "series_id_str" to JsonPrimitive("123456"),
-                "series_id" to JsonPrimitive("123456"),
-                "series_title" to JsonPrimitive("测试短剧"),
-                "series_name" to JsonPrimitive("测试短剧"),
-                "series_cover" to JsonPrimitive("https://example.com/cover.jpg"),
-                "series_intro" to JsonPrimitive("这是简介"),
-                "video_desc" to JsonPrimitive("视频描述"),
-                "episode_cnt" to JsonPrimitive("30"),
-                "episode_right_text" to JsonPrimitive("更新至30集"),
-                "score" to JsonPrimitive("9.5"),
-                "category_name" to JsonPrimitive("真人剧"),
-                "series_status" to JsonPrimitive("1"),
-                "tags" to JsonPrimitive("热门,推荐"),
-                "category_list" to JsonArray(listOf(
-                    JsonObject(mapOf("name" to JsonPrimitive("都市"))),
-                    JsonObject(mapOf("name" to JsonPrimitive("甜宠"))),
-                )),
-            ))
-        ))
-
-        val drama = HongguoAppClientTestAccessor.parseLandpageItem(itemJson)
-
-        assertNotNull("必须解析出 Drama", drama)
-        assertEquals("backendId 应为 series_id", "123456", drama!!.backendId)
-        assertEquals("id 应为 series_id.toInt()", 123456, drama.id)
-        assertEquals("sourceId 必须为 hongguo", "hongguo", drama.sourceId)
-        assertEquals("name", "测试短剧", drama.name)
-        assertEquals("pic", "https://example.com/cover.jpg", drama.pic)
-        assertEquals("type", "真人剧", drama.type)
-        assertEquals("remarks", "更新至30集", drama.remarks)
-        assertEquals("score", "9.5", drama.score)
-        assertEquals("blurb", "这是简介", drama.blurb)
-        assertEquals("detail", "这是简介", drama.detail)
-        assertEquals("tag 包含 tags 和 category_list", "热门,推荐,都市,甜宠", drama.tag)
-        assertEquals("playGroups 为空列表（详情页再填充）", 1, drama.playGroups.size)
-        assertTrue("playGroups[0].episodes 为空", drama.playGroups[0].episodes.isEmpty())
-    }
+    /** 真实 landpage 首条（2026-10 抓包，字段名与网页通道不同） */
+    private val realLandpageItem = JsonObject(
+        mapOf(
+            "series_id" to JsonPrimitive("7693846533267016728"),
+            "title" to JsonPrimitive("牌下深渊"),
+            "cover" to JsonPrimitive("https://p3-reading-sign.fqnovelpic.com/novel-pic/889ecc.jpg"),
+            "video_desc" to JsonPrimitive("林晴前世欠下巨额债务，重生回到悲剧发生之前。"),
+            "episode_cnt" to JsonPrimitive(38),
+            "score" to JsonPrimitive("8.4"),
+            "vid" to JsonPrimitive("7693849422186155033"),
+            "category_schema" to JsonPrimitive(
+                "[{\"category_id\":5022,\"name\":\"都市\"},{\"category_id\":5069,\"name\":\"重生逆袭\"}]"
+            ),
+        )
+    )
 
     @Test
-    fun testParseLandpageItem_invalidSeriesId_returnsNull() {
-        val itemJson = JsonObject(mapOf(
-            "video_data" to JsonObject(mapOf(
-                "series_id_str" to JsonPrimitive("abc"), // 非数字
-                "series_title" to JsonPrimitive("测试"),
-            ))
-        ))
-
-        val drama = HongguoAppClientTestAccessor.parseLandpageItem(itemJson)
-        assertNull("非数字 series_id 应返回 null", drama)
-    }
-
-    @Test
-    fun testParseLandpageItem_missingVideoData_usesRoot() {
-        // 兼容：video_data 可能在根层级
-        val itemJson = JsonObject(mapOf(
-            "series_id_str" to JsonPrimitive("789012"),
-            "series_title" to JsonPrimitive("根层级剧集"),
-            "series_cover" to JsonPrimitive("https://example.com/cover2.jpg"),
-        ))
-
-        val drama = HongguoAppClientTestAccessor.parseLandpageItem(itemJson)
-
+    fun `real landpage item maps to Drama`() {
+        val drama = hongguoDramaFromItem(realLandpageItem)
         assertNotNull(drama)
-        assertEquals("789012", drama!!.backendId)
-        assertEquals("根层级剧集", drama.name)
+        drama!!
+        assertEquals("7693846533267016728", drama.backendId)
+        assertEquals("hongguo", drama.sourceId)
+        assertEquals("牌下深渊", drama.name)
+        assertEquals("https://p3-reading-sign.fqnovelpic.com/novel-pic/889ecc.jpg", drama.pic)
+        assertEquals("林晴前世欠下巨额债务，重生回到悲剧发生之前。", drama.blurb)
+        // episode_cnt 是数字，不是字符串
+        assertEquals("共38集", drama.remarks)
+        assertEquals("8.4", drama.score)
+        // category_schema 是被转义的 JSON 字符串，要展开成标签
+        assertEquals("都市,重生逆袭", drama.tag)
+        assertEquals("都市", drama.type)
+        assertTrue("列表条目不带分集", drama.playGroups.first().episodes.isEmpty())
+        assertEquals(HONGGUO_GROUP, drama.playGroups.first().name)
     }
 
-    // ========== 3. 签名一致性回归（复用 HongguoSignTest 的 golden 值） ==========
+    @Test
+    fun `web item with video_data wrapper and series_name`() {
+        // 真实 category_page recommendList 首条（2026-10 抓包）
+        val item = JsonObject(
+            mapOf(
+                "episode_cnt" to JsonPrimitive(69),
+                "series_id" to JsonPrimitive("7686713195246930968"),
+                "series_name" to JsonPrimitive("首辅娇娘"),
+                "series_cover" to JsonPrimitive("https://p3-novel.byteimg.com/novel-pic/a2cb13.jpg"),
+                "series_intro" to JsonPrimitive("现代杀手顾娇坠机穿越。"),
+                "tags" to JsonArray(listOf(JsonPrimitive("爱情"), JsonPrimitive("古风爱情"))),
+                "episode_right_text" to JsonPrimitive("全69集"),
+                "celebrities" to JsonArray(
+                    listOf(
+                        JsonObject(mapOf("nickname" to JsonPrimitive("孟娜"), "sub_title" to JsonPrimitive("饰 顾娇"))),
+                        JsonObject(mapOf("nickname" to JsonPrimitive("刘润铭"))),
+                    )
+                ),
+            )
+        )
+        val drama = hongguoDramaFromItem(item, "真人剧")!!
+        assertEquals("7686713195246930968", drama.backendId)
+        assertEquals("首辅娇娘", drama.name)
+        assertEquals("全69集", drama.remarks)
+        assertEquals("爱情,古风爱情", drama.tag)
+        assertEquals("孟娜,刘润铭", drama.actors)
+        // 无 category_name 时按 Go 的优先级：首个标签 > 路由名
+        assertEquals("爱情", drama.type)
+    }
 
     @Test
-    fun testSign_consistentWithGo_golden() {
-        // 使用 HongguoSignTest 中相同的固定输入
-        val query = "aid=8662&app_name=novelread&version_code=73532&version_name=7.3.5.32&manifest_version_code=73532&update_version_code=73532&channel=update_64&device_platform=android&os=android&ssmix=a&device_type=25053RT47C&device_brand=Redmi&language=zh&os_api=36&os_version=16&resolution=1280*2772&dpi=520&ac=wifi&device_id=$deviceId&iid=$deviceId&_rticket=$fixedRticket"
-        val bodyBytes = """{"test":"body"}""".toByteArray()
+    fun `non numeric series id returns null`() {
+        assertNull(hongguoDramaFromItem(JsonObject(mapOf("series_id_str" to JsonPrimitive("abc")))))
+        assertNull(hongguoDramaFromItem(JsonObject(mapOf("title" to JsonPrimitive("无 id")))))
+    }
 
-        val (gorgon, khronos, _) = HongguoSign.sign(query, bodyBytes, fixedTs)
+    @Test
+    fun `parseLandpageRows rejects missing data or video_data`() {
+        val client = newClient()
+        assertThrows(Exception::class.java) {
+            client.parseLandpageRows(JsonObject(emptyMap()))
+        }
+        assertThrows(Exception::class.java) {
+            client.parseLandpageRows(
+                JsonObject(mapOf("data" to JsonObject(mapOf("has_more" to JsonPrimitive(true)))))
+            )
+        }
+        // 有行但全都识别不了 -> 抛错，不能静默当成「到底」
+        assertThrows(Exception::class.java) {
+            client.parseLandpageRows(
+                JsonObject(
+                    mapOf(
+                        "data" to JsonObject(
+                            mapOf("video_data" to JsonArray(listOf(JsonObject(mapOf("x" to JsonPrimitive(1))))))
+                        )
+                    )
+                )
+            )
+        }
+        val ok = client.parseLandpageRows(
+            JsonObject(
+                mapOf(
+                    "data" to JsonObject(
+                        mapOf("video_data" to JsonArray(listOf(realLandpageItem)))
+                    )
+                )
+            )
+        )
+        assertEquals(1, ok.size)
+    }
 
-        // 这些值来自 Go 实现（provider_hongguo_sign.go），已在 HongguoSignTest 验证
-        // 这里只做长度和前缀校验，避免硬编码完整值重复
+    // ========== 4. 分集列表 ==========
+
+    @Test
+    fun `vid_list of plain strings numbers positionally`() {
+        val eps = parseHongguoVidList(
+            JsonArray(listOf(JsonPrimitive("111"), JsonPrimitive("222"))),
+            "7686713195246930968",
+        )
+        assertEquals(2, eps.size)
+        assertEquals(1, eps[0].index)
+        assertEquals("hongguo://7686713195246930968/111", eps[0].rawUrl)
+        assertEquals("第2集", eps[1].title)
+        assertTrue(eps[0].isDirectStream)
+    }
+
+    @Test
+    fun `video_list objects use vid_index, sorted and deduped`() {
+        val eps = parseHongguoVidList(
+            JsonArray(
+                listOf(
+                    JsonObject(mapOf("vid" to JsonPrimitive("300"), "vid_index" to JsonPrimitive(3))),
+                    JsonObject(mapOf("vid" to JsonPrimitive("100"), "vid_index" to JsonPrimitive(1))),
+                    JsonObject(mapOf("vid" to JsonPrimitive("100"), "vid_index" to JsonPrimitive(1))),
+                    JsonObject(mapOf("vid" to JsonPrimitive("200"), "vid_index" to JsonPrimitive(2))),
+                )
+            ),
+            "series",
+        )
+        assertEquals(listOf(1, 2, 3), eps.map { it.index })
+        assertEquals(listOf("100", "200", "300"), eps.map { it.rawUrl.substringAfterLast('/') })
+    }
+
+    @Test
+    fun `episodes of another series are dropped`() {
+        val eps = parseHongguoVidList(
+            JsonArray(
+                listOf(
+                    JsonObject(mapOf("vid" to JsonPrimitive("1"), "series_id" to JsonPrimitive("mine"))),
+                    JsonObject(mapOf("vid" to JsonPrimitive("2"), "series_id" to JsonPrimitive("other"))),
+                )
+            ),
+            "mine",
+        )
+        assertEquals(1, eps.size)
+        assertEquals("hongguo://mine/1", eps[0].rawUrl)
+    }
+
+    @Test
+    fun `non numeric vid and invalid index are ignored`() {
+        val eps = parseHongguoVidList(
+            JsonArray(
+                listOf(
+                    JsonObject(mapOf("vid" to JsonPrimitive("abc"))),
+                    JsonObject(mapOf("vid" to JsonPrimitive("9"), "vid_index" to JsonPrimitive(0))),
+                    JsonPrimitive(nullString()),
+                )
+            ),
+            "s",
+        )
+        assertTrue(eps.isEmpty())
+    }
+
+    @Test
+    fun `object wrapped list yields episodes`() {
+        val eps = parseHongguoVidList(
+            JsonObject(mapOf("list" to JsonArray(listOf(JsonPrimitive("7"))))),
+            "s",
+        )
+        assertEquals(1, eps.size)
+        assertEquals("hongguo://s/7", eps[0].rawUrl)
+    }
+
+    // ========== 5. 选流 ==========
+
+    @Test
+    fun `picks the highest quality clear stream`() {
+        val videoList = JsonArray(
+            listOf(
+                variant("h264", 720, "https://example.com/720p_h264.m3u8"),
+                variant("hevc", 1080, "https://example.com/1080p_hevc.m3u8"),
+                variant("avc1", 480, "https://example.com/480p_h264.m3u8"),
+            )
+        )
+        assertEquals("https://example.com/1080p_hevc.m3u8", selectClearStream(videoList))
+    }
+
+    @Test
+    fun `skips bytevc2 and encrypted variants`() {
+        val videoList = JsonArray(
+            listOf(
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(
+                            mapOf("codec_type" to JsonPrimitive("bytevc2"), "vheight" to JsonPrimitive("1080"))
+                        ),
+                        "main_url" to JsonPrimitive("https://example.com/bytevc2.m3u8"),
+                    )
+                ),
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"), "vheight" to JsonPrimitive("1080"))),
+                        "encrypt_info" to JsonObject(mapOf("spade_a" to JsonPrimitive("key"))),
+                        "main_url" to JsonPrimitive("https://example.com/encrypted.m3u8"),
+                    )
+                ),
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"), "vheight" to JsonPrimitive("720"))),
+                        "encrypt_info" to JsonObject(mapOf("encrypt" to JsonPrimitive(true))),
+                        "main_url" to JsonPrimitive("https://example.com/encrypted2.m3u8"),
+                    )
+                ),
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"), "vheight" to JsonPrimitive("480"))),
+                        "encrypt_info" to JsonObject(mapOf("encryption_method" to JsonPrimitive("cenc-aes-ctr"))),
+                        "main_url" to JsonPrimitive("https://example.com/cenc.m3u8"),
+                    )
+                ),
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"), "vheight" to JsonPrimitive("1080"))),
+                        "gear_des_key" to JsonPrimitive("bytevc2_x"),
+                        "main_url" to JsonPrimitive("https://example.com/gear.m3u8"),
+                    )
+                ),
+                variant("h264", 720, "https://example.com/clear.m3u8"),
+            )
+        )
+        assertEquals("https://example.com/clear.m3u8", selectClearStream(videoList))
+    }
+
+    @Test
+    fun `returns null when no clear stream`() {
+        val videoList = JsonArray(
+            listOf(
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"))),
+                        "encrypt_info" to JsonObject(mapOf("spade_a" to JsonPrimitive("key"))),
+                        "main_url" to JsonPrimitive("https://example.com/encrypted.m3u8"),
+                    )
+                ),
+            )
+        )
+        assertNull(selectClearStream(videoList))
+        assertNull(selectClearStream(JsonArray(emptyList())))
+    }
+
+    @Test
+    fun `falls back to backup_url and decodes base64`() {
+        val videoList = JsonArray(
+            listOf(
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"), "vheight" to JsonPrimitive("720"))),
+                        "main_url" to JsonPrimitive(""),
+                        "backup_url" to JsonPrimitive("https://example.com/backup.m3u8"),
+                    )
+                ),
+            )
+        )
+        assertEquals("https://example.com/backup.m3u8", selectClearStream(videoList))
+
+        // 网页通道的 main_url 是 base64
+        val encoded = "https://v.example.com/1/index.m3u8".toByteArray().let { java.util.Base64.getEncoder().encodeToString(it) }
+        val b64 = JsonArray(
+            listOf(
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"), "vheight" to JsonPrimitive("720"))),
+                        "main_url" to JsonPrimitive(encoded),
+                    )
+                ),
+                // 无填充形态也要能解
+                JsonObject(
+                    mapOf(
+                        "video_meta" to JsonObject(mapOf("codec_type" to JsonPrimitive("h264"), "vheight" to JsonPrimitive("540"))),
+                        "main_url" to JsonPrimitive(encoded.trimEnd('=')),
+                    )
+                ),
+            )
+        )
+        assertEquals("https://v.example.com/1/index.m3u8", selectClearStream(b64))
+    }
+
+    @Test
+    fun `definition wins over vheight`() {
+        val videoList = JsonArray(
+            listOf(
+                variant("h264", 720, "https://example.com/def_1080.m3u8", definition = "1080p"),
+                variant("h264", 1080, "https://example.com/vheight_1080.m3u8", definition = "720p"),
+            )
+        )
+        assertEquals("https://example.com/def_1080.m3u8", selectClearStream(videoList))
+    }
+
+    @Test
+    fun `object shaped video_list expands sorted by key`() {
+        val model = JsonObject(
+            mapOf(
+                "video_list" to JsonObject(
+                    mapOf(
+                        "3" to variant("h264", 720, "https://example.com/low.m3u8"),
+                        "5" to variant("h264", 1080, "https://example.com/high.m3u8"),
+                    )
+                )
+            )
+        )
+        assertEquals(2, videoModelVariants(model).size)
+        assertEquals("https://example.com/high.m3u8", selectClearStream(videoModelVariants(model)))
+    }
+
+    @Test
+    fun `parseVideoModel accepts object and JSON string`() {
+        val obj = JsonObject(mapOf("video_model" to JsonObject(mapOf("x" to JsonPrimitive(1)))))
+        assertNotNull(parseVideoModel(obj))
+
+        val str = JsonObject(
+            mapOf("video_model" to JsonPrimitive("""{"video_list":[{"main_url":"https://example.com/s.m3u8"}]}"""))
+        )
+        val model = parseVideoModel(str)
+        assertNotNull(model)
+        assertEquals(1, model!!.getJsonArray("video_list")!!.size)
+
+        assertNull(parseVideoModel(JsonObject(mapOf("other" to JsonPrimitive("v")))))
+        assertNull(parseVideoModel(JsonObject(mapOf("video_model" to JsonPrimitive("null")))))
+    }
+
+    // ========== 6. key 一致性 ==========
+
+    @Test
+    fun `Drama key, favorite key and download id share one shape`() {
+        val drama = hongguoDramaFromItem(realLandpageItem)!!
+        val seriesId = "7693846533267016728"
+
+        // 19 位 series_id 放不进 Int，必须走掩码散列，且同一条 id 稳定
+        assertEquals(drama.id, hongguoDramaFromItem(realLandpageItem)!!.id)
+        assertEquals(seriesId, drama.backendId)
+
+        // Drama.key 与只存了元信息的收藏键必须一致，否则「在看/已收藏」匹配不上
+        assertEquals("hongguo#$seriesId", drama.key)
+        assertEquals(drama.key, entryKey(drama.sourceId, drama.id, drama.backendId))
+        assertNotEquals("hongguo#${drama.id}", drama.key)
+
+        // 下载任务 id 以 key 打头，substringBeforeLast('#') 才能还原回 drama.key
+        val id = DljDownloadManager.downloadId(drama.key, 7)
+        assertEquals("hongguo#$seriesId#7", id)
+        assertEquals(drama.key, id.substringBeforeLast('#'))
+    }
+
+    @Test
+    fun `CMS key falls back to id without backendId`() {
+        assertEquals("ffzy#12345", entryKey("ffzy", 12345, null))
+        assertEquals("ffzy#12345", entryKey("ffzy", 12345, ""))
+    }
+
+    // ========== 7. 签名与 header 完整性 ==========
+
+    @Test
+    fun `signature length and prefix follow the protocol`() {
+        val query = "aid=8662&device_id=$deviceId&_rticket=$fixedRticket"
+        val body = """{"offset":0}""".toByteArray()
+        val (gorgon, khronos, _) = HongguoSign.sign(query, body, fixedTs)
         assertEquals(52, gorgon.length)
-        assertTrue(gorgon.startsWith("8404401c0000"))
+        assertTrue(gorgon, gorgon.startsWith("8404401c0000"))
         assertEquals(fixedTs.toString(), khronos)
+        assertEquals(32, HongguoSign.stub(body).length)
+        assertTrue(HongguoSign.stub(body).all { it.isUpperCase() || it.isDigit() })
     }
 
-    // ========== 4. 选流纯函数测试 ==========
+    private fun newClient(): HongguoAppClient = HongguoAppClient(okhttp3.OkHttpClient(), deviceId)
 
-    @Test
-    fun testSelectClearStream_picksHighestQualityH264() {
-        // 伪造 video_list：包含多个清晰度、编码的明流
-        val videoList = JsonArray(listOf(
-            // 720p h264 (score = 720*10 + 1 = 7201)
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("720"),
-                    "vwidth" to JsonPrimitive("1280"),
-                    "definition" to JsonPrimitive("720p"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/720p_h264.m3u8"),
-            )),
-            // 1080p hevc (score = 1080*10 = 10800)
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("hevc"),
-                    "vheight" to JsonPrimitive("1080"),
-                    "vwidth" to JsonPrimitive("1920"),
-                    "definition" to JsonPrimitive("1080p"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/1080p_hevc.m3u8"),
-            )),
-            // 480p h264 (score = 480*10 + 1 = 4801)
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("avc1"),
-                    "vheight" to JsonPrimitive("480"),
-                    "vwidth" to JsonPrimitive("854"),
-                    "definition" to JsonPrimitive("480p"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/480p_h264.m3u8"),
-            )),
-        ))
-
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNotNull("应选出最高分流", selected)
-        assertEquals("应选 1080p hevc（分最高）", "https://example.com/1080p_hevc.m3u8", selected)
-    }
-
-    @Test
-    fun testSelectClearStream_skipsBytevc2() {
-        val videoList = JsonArray(listOf(
-            // bytevc2 编码应被跳过
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("bytevc2"),
-                    "vheight" to JsonPrimitive("1080"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/bytevc2.m3u8"),
-            )),
-            // 正常 h264
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("720"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/normal.m3u8"),
-            )),
-        ))
-
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNotNull(selected)
-        assertEquals("应跳过 bytevc2，选正常流", "https://example.com/normal.m3u8", selected)
-    }
-
-    @Test
-    fun testSelectClearStream_skipsEncryptedVariants() {
-        val videoList = JsonArray(listOf(
-            // 有 spade_a 的加密流
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("1080"),
-                )),
-                "encrypt_info" to JsonObject(mapOf(
-                    "spade_a" to JsonPrimitive("encrypted_key_data"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/encrypted.m3u8"),
-            )),
-            // encrypt=true 的加密流
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("720"),
-                )),
-                "encrypt_info" to JsonObject(mapOf(
-                    "encrypt" to JsonPrimitive("true"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/encrypted2.m3u8"),
-            )),
-            // encryption_method=cenc-aes-ctr 的加密流
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("480"),
-                )),
-                "encrypt_info" to JsonObject(mapOf(
-                    "encryption_method" to JsonPrimitive("cenc-aes-ctr"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/encrypted3.m3u8"),
-            )),
-            // 明流
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("720"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/clear.m3u8"),
-            )),
-        ))
-
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNotNull(selected)
-        assertEquals("应跳过所有加密变体，选明流", "https://example.com/clear.m3u8", selected)
-    }
-
-    @Test
-    fun testSelectClearStream_skipsGearDesKeyBytevc2() {
-        val videoList = JsonArray(listOf(
-            // gear_des_key 含 bytevc2 应被跳过
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("1080"),
-                )),
-                "gear_des_key" to JsonPrimitive("bytevc2_key_data"),
-                "main_url" to JsonPrimitive("https://example.com/gear_bytevc2.m3u8"),
-            )),
-            // 正常流
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("720"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/normal.m3u8"),
-            )),
-        ))
-
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNotNull(selected)
-        assertEquals("应跳过 gear_des_key 含 bytevc2", "https://example.com/normal.m3u8", selected)
-    }
-
-    @Test
-    fun testSelectClearStream_noClearStream_returnsNull() {
-        val videoList = JsonArray(listOf(
-            // 全是加密流
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("1080"),
-                )),
-                "encrypt_info" to JsonObject(mapOf(
-                    "spade_a" to JsonPrimitive("key"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/encrypted.m3u8"),
-            )),
-            // 全是 bytevc2
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("bytevc2"),
-                    "vheight" to JsonPrimitive("720"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/bytevc2.m3u8"),
-            )),
-        ))
-
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNull("无明流时应返回 null", selected)
-    }
-
-    @Test
-    fun testSelectClearStream_emptyList_returnsNull() {
-        val videoList = JsonArray(emptyList())
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNull("空列表应返回 null", selected)
-    }
-
-    @Test
-    fun testSelectClearStream_usesBackupUrls() {
-        // main_url 为空，backup_url 有值
-        val videoList = JsonArray(listOf(
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("720"),
-                )),
-                "main_url" to JsonPrimitive(""),
-                "backup_url" to JsonPrimitive("https://example.com/backup.m3u8"),
-            )),
-        ))
-
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNotNull(selected)
-        assertEquals("应使用 backup_url", "https://example.com/backup.m3u8", selected)
-    }
-
-    @Test
-    fun testSelectClearStream_usesDefinitionOverVheight() {
-        // definition 优先于 vheight
-        val videoList = JsonArray(listOf(
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("720"),
-                    "definition" to JsonPrimitive("1080p"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/def_1080.m3u8"),
-            )),
-            JsonObject(mapOf(
-                "video_meta" to JsonObject(mapOf(
-                    "codec_type" to JsonPrimitive("h264"),
-                    "vheight" to JsonPrimitive("1080"),
-                    "definition" to JsonPrimitive("720p"),
-                )),
-                "main_url" to JsonPrimitive("https://example.com/vheight_1080.m3u8"),
-            )),
-        ))
-
-        val selected = HongguoAppClientTestAccessor.selectClearStreamTest(videoList)
-        assertNotNull(selected)
-        assertEquals("应优先使用 definition", "https://example.com/def_1080.m3u8", selected)
-    }
-
-    @Test
-    fun testParseVideoModel_object() {
-        val data = JsonObject(mapOf(
-            "video_model" to JsonObject(mapOf(
-                "video_list" to JsonArray(listOf(
-                    JsonObject(mapOf("main_url" to JsonPrimitive("https://example.com/test.m3u8"))),
-                )),
-            )),
-        ))
-
-        val model = HongguoAppClientTestAccessor.parseVideoModelTest(data)
-        assertNotNull(model)
-        assertNotNull(model!!.getJsonArray("video_list"))
-    }
-
-    @Test
-    fun testParseVideoModel_jsonString() {
-        val innerJson = """{"video_list":[{"main_url":"https://example.com/from_string.m3u8"}]}"""
-        val data = JsonObject(mapOf(
-            "video_model" to JsonPrimitive(innerJson),
-        ))
-
-        val model = HongguoAppClientTestAccessor.parseVideoModelTest(data)
-        assertNotNull(model)
-        val list = model!!.getJsonArray("video_list")!!
-        assertEquals(1, list.size)
-    }
-
-    @Test
-    fun testParseVideoModel_missing_returnsNull() {
-        val data = JsonObject(mapOf(
-            "other_field" to JsonPrimitive("value"),
-        ))
-
-        val model = HongguoAppClientTestAccessor.parseVideoModelTest(data)
-        assertNull(model)
-    }
-}
-
-/**
- * 测试访问器：将 HongguoAppClient 内部私有逻辑暴露为可测试的纯函数
- * 实际项目中可考虑将这些逻辑提取到单独的工具类/顶层函数
- */
-object HongguoAppClientTestAccessor {
-
-    /** 构建基础 query 参数（对应 HongguoAppClient.baseQueryParams + _rticket） */
-    fun buildQueryParams(deviceId: String, rticket: String): Map<String, String> {
-        return mapOf(
-            "aid" to "8662",
-            "app_name" to "novelread",
-            "version_code" to "73532",
-            "version_name" to "7.3.5.32",
-            "manifest_version_code" to "73532",
-            "update_version_code" to "73532",
-            "channel" to "update_64",
-            "device_platform" to "android",
-            "os" to "android",
-            "ssmix" to "a",
-            "device_type" to "25053RT47C",
-            "device_brand" to "Redmi",
-            "language" to "zh",
-            "os_api" to "36",
-            "os_version" to "16",
-            "resolution" to "1280*2772",
-            "dpi" to "520",
-            "ac" to "wifi",
-            "device_id" to deviceId,
-            "iid" to deviceId,
-            "_rticket" to rticket,
+    private fun variant(codec: String, height: Int, url: String, definition: String? = null): JsonObject =
+        JsonObject(
+            mapOf(
+                "video_meta" to JsonObject(
+                    buildMap {
+                        put("codec_type", JsonPrimitive(codec))
+                        put("vheight", JsonPrimitive(height))
+                        definition?.let { put("definition", JsonPrimitive(it)) }
+                    }
+                ),
+                "main_url" to JsonPrimitive(url),
+            )
         )
-    }
 
-    /** 构建完整请求头（对应 HongguoAppClient.postWithSign 中的签名逻辑） */
-    fun buildHeaders(rawQuery: String, bodyBytes: ByteArray, timestampSec: Long): Map<String, String> {
-        val (xGorgon, xKhronos, xReqTicket) = HongguoSign.sign(rawQuery, bodyBytes, timestampSec)
-        val stub = if (bodyBytes.isNotEmpty()) HongguoSign.stub(bodyBytes) else ""
-        return mapOf(
-            "User-Agent" to "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)",
-            "Accept" to "application/json",
-            "X-XS-From-Web" to "0",
-            "Sdk-Version" to "2",
-            "Content-Type" to "application/json; charset=utf-8",
-            "X-Gorgon" to xGorgon,
-            "X-Khronos" to xKhronos,
-            "X-SS-Req-Ticket" to xReqTicket,
-            "X-SS-STUB" to stub,
-        )
-    }
+    private fun JsonObject.getJsonPrimitive(key: String): String? =
+        (this[key] as? JsonPrimitive)?.content
 
-    /** 解析 landpage 单条条目（复用 HongguoAppClient 内部逻辑） */
-    fun parseLandpageItem(item: JsonObject): Drama? {
-        val vd = (item["video_data"] as? JsonObject) ?: item
+    private fun nullString(): String = "null"
 
-        val seriesId = vd.strOrNull("series_id_str") ?: vd.strOrNull("series_id")
-            ?: item.strOrNull("series_id_str") ?: item.strOrNull("series_id")
-            ?: return null
-
-        if (!seriesId.matches(Regex("^\\d+$"))) return null
-
-        val title = vd.strOrNull("series_title") ?: vd.strOrNull("series_name") ?: vd.strOrNull("title")
-            ?: item.strOrNull("series_name") ?: item.strOrNull("name") ?: seriesId
-        val cover = vd.strOrNull("series_cover") ?: vd.strOrNull("cover")
-            ?: item.strOrNull("series_cover") ?: ""
-        val intro = vd.strOrNull("series_intro") ?: vd.strOrNull("video_desc")
-            ?: item.strOrNull("series_intro") ?: ""
-        val count = vd.strOrNull("episode_cnt") ?: item.strOrNull("episode_cnt") ?: ""
-        val remark = vd.strOrNull("episode_right_text") ?: item.strOrNull("episode_right_text")
-            ?: (if (count.isNotBlank()) "共${count}集" else "")
-        val score = vd.strOrNull("score") ?: ""
-        val genre = vd.strOrNull("category_name") ?: vd.strOrNull("categoryName") ?: vd.strOrNull("category") ?: "短剧"
-
-        val status = vd.strOrNull("series_status")
-        val tags = mutableListOf<String>()
-        val tagStr = vd.strOrNull("tags")
-        if (tagStr?.isNotBlank() == true) {
-            tags.addAll(tagStr.split(",").map { it.trim() }.filter { it.isNotBlank() })
-        }
-        val categoryList = anyList(vd["category_list"])
-        for (cat in categoryList) {
-            val name = (cat as? JsonObject)?.strOrNull("name")
-            if (name?.isNotBlank() == true && name !in tags) tags.add(name)
-        }
-
-        return Drama(
-            id = seriesId.toIntOrNull() ?: seriesId.hashCode(),
-            sourceId = "hongguo",
-            name = title,
-            pic = cover,
-            type = genre,
-            typeId = 0,
-            remarks = remark,
-            year = "",
-            area = "",
-            director = "",
-            actors = "",
-            blurb = intro,
-            detail = intro,
-            tag = tags.joinToString(","),
-            score = score,
-            updated = "",
-            playGroups = listOf(PlayGroup("红果官方", emptyList())),
-            backendId = seriesId,
-        )
-    }
-
-    private fun anyList(v: kotlinx.serialization.json.JsonElement?): List<kotlinx.serialization.json.JsonElement> {
-        return when (v) {
-            is kotlinx.serialization.json.JsonArray -> v.toList()
-            is kotlinx.serialization.json.JsonObject -> {
-                for (key in listOf("list", "items", "data")) {
-                    val arr = v[key] as? kotlinx.serialization.json.JsonArray
-                    if (arr != null) return arr.toList()
-                }
-                emptyList()
-            }
-            else -> emptyList()
-        }
-    }
-
-    private fun kotlinx.serialization.json.JsonObject.strOrNull(key: String): String? {
-        val p = this[key] as? kotlinx.serialization.json.JsonPrimitive ?: return null
-        val content = p.content
-        return if (content == "null") null else content.takeIf { it.isNotBlank() }
-    }
-
-    /** 选流纯函数（委托给顶层 selectClearStream） */
-    fun selectClearStreamTest(videoList: JsonArray): String? {
-        return selectClearStream(videoList)
-    }
-
-    /** 解析 video_model（委托给顶层 parseVideoModel） */
-    fun parseVideoModelTest(data: JsonObject): JsonObject? {
-        return parseVideoModel(data)
+    private companion object {
+        const val HONGGUO_GROUP = "红果官方"
     }
 }

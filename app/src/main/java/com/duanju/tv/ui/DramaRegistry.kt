@@ -24,7 +24,10 @@ object DramaRegistry {
         private set
 
     fun put(drama: Drama): String {
-        map[drama.key] = drama
+        // 同一部剧可能先以「剧壳」（列表项，无分集）进来，之后详情页补齐分集回填。
+        // 播放器仍然按 key 取，这里保留分集更全的那份，避免被壳覆盖成不可播。
+        val better = map[drama.key]?.takeIf { it.episodeCount > drama.episodeCount } ?: drama
+        map[better.key] = better
         if (map.size > MAX) {
             val it = map.entries.iterator()
             while (map.size > MAX && it.hasNext()) {
@@ -32,8 +35,8 @@ object DramaRegistry {
                 it.remove()
             }
         }
-        current = drama
-        return drama.key
+        current = better
+        return better.key
     }
 
     fun get(key: String?): Drama? {

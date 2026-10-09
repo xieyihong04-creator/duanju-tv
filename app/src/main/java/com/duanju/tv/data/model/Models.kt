@@ -31,7 +31,7 @@ data class Drama(
     val episodeCount: Int get() = playGroups.maxOfOrNull { it.episodes.size } ?: 0
 
     /** 同一部剧在聚合源中的唯一键：优先用 backendId，回落到 id */
-    val key: String get() = "$sourceId#${backendId ?: id}"
+    val key: String get() = entryKey(sourceId, id, backendId)
 
     val bestGroup: PlayGroup? get() = playGroups.maxByOrNull { it.episodes.size }
 
@@ -61,7 +61,8 @@ data class Episode(
     val rawUrl: String,
 ) {
     val isDirectStream: Boolean
-        get() = rawUrl.contains(".m3u8") || rawUrl.contains(".mp4") || rawUrl.contains(".mpd")
+        get() = rawUrl.startsWith("hongguo://") ||
+            rawUrl.contains(".m3u8") || rawUrl.contains(".mp4") || rawUrl.contains(".mpd")
 }
 
 /** 播放解析结果 */
@@ -92,8 +93,11 @@ data class FavoriteEntry(
     val addedAt: Long,
     /** 缓存完整详情，收藏列表点击后无需重新请求 */
     val drama: Drama? = null,
+    /** 与 [Drama.backendId] 对应；红果这类源的 id 是散列值，必须靠它对齐 key */
+    val backendId: String? = null,
 ) {
-    val key: String get() = "$sourceId#$dramaId"
+    /** 有缓存的 Drama 就以它的键为准，兼容 v1.1.0 没写 backendId 的旧收藏 */
+    val key: String get() = drama?.key ?: entryKey(sourceId, dramaId, backendId)
 }
 
 @Serializable
@@ -109,9 +113,19 @@ data class HistoryEntry(
     val durationMs: Long,
     val updatedAt: Long,
     val drama: Drama? = null,
+    val backendId: String? = null,
 ) {
-    val key: String get() = "$sourceId#$dramaId"
+    val key: String get() = drama?.key ?: entryKey(sourceId, dramaId, backendId)
 
     val percent: Int
         get() = if (durationMs <= 0) 0 else (positionMs * 100 / durationMs).toInt().coerceIn(0, 100)
 }
+
+/**
+ * 追剧条目的唯一键，必须与 [Drama.key] 同构。
+ *
+ * 红果这类源的 [Drama.id] 由 series_id 散列得到，只用 id 会和详情页的
+ * backendId 键对不上，收藏/进度/缓存就再也找不回来。
+ */
+fun entryKey(sourceId: String, dramaId: Int, backendId: String?): String =
+    "$sourceId#${backendId?.takeIf { it.isNotBlank() } ?: dramaId}"

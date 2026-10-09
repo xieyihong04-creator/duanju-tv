@@ -25,6 +25,18 @@
 部分源的播放地址是分享页形式，需带浏览器 UA + Referer 二次解析出 `index.m3u8?sign=...`；
 签名与请求头绑定，因此**每集单独构建 ExoPlayer 实例**。
 
+红果·短剧走专用双通道，不再是 macCMS 约定：
+
+- **App 通道**（`HongguoAppClient`）：X-Gorgon 签名的 `landpage` 推荐流。分页是**游标制**
+  （`offset + session_id + client_req_type`），不认页码——裸传页码会静默拿到重复内容，
+  因此游标由 `DramaRepository` 逐页保存，并加了「游标未前进 / 会话非法 / 整页签名重复」三道防呆。
+  详情与取流（`video_detail` / `video_model`）对未注册 `device_id` 返回空响应或业务码 110001，
+  属永久失败：识别为 `PermanentAppError` 后**不重试**，并让 App 媒体通道冷却 30 分钟，直接走网页通道。
+- **网页通道**（`HongguoClient`）：抓 `hongguoduanju.com` 页面内 `window._ROUTER_DATA`，
+  分类/详情/搜索/取流均可用；搜索页字段是 `searchList` / `totalCount`。
+- 剧集统一编码为 `hongguo://seriesId/vid`，播放时先 App 后网页解析出直连 mp4（地址无扩展名，
+  以 `mime_type=video_mp4` 标注），CENC 仅过滤不解密。
+
 数据源清单维护在 `CmsApi.kt` 的内置列表，也可在设置页切换；接口约定变更时优先改 `SourceSpec`。
 
 排行接口在多数源上不可用，热度由本地 `HotRanker` 估算：
@@ -60,14 +72,22 @@ keyPassword=<口令>
 
 ```bash
 ./gradlew :app:assembleRelease    # app/build/outputs/apk/release/DuanjuTV-release-<version>.apk
-./gradlew :app:testDebugUnitTest  # 26 个测试：数据层 / 排序 / 真机网络
+./gradlew :app:testDebugUnitTest -PskipLiveNetworkTests   # 64 个离线测试
+./gradlew :app:testDebugUnitTest --tests '*LiveNetworkTest'  # 4 个真机网络测试
 ```
 
 ## 测试
 
 - `DataLayerTest`（18）：macCMS 编码解析、剧集排序、分享页还原、进度持久化原子性
+- `HongguoAppClientTest`（23）：红果 App 通道报文序列化、landpage 条目（App/网页两种形态）解析、
+  分集 vid 解析、清晰度选流（含 base64）、分页签名与黄金哈希、跨模块 key 一致性
+- `HongguoProtocolTest`（14）：Interceptor 桩模拟真实响应，验证游标分页/防呆/永久失败不重试/
+  Repository 双通道回退与媒体冷却；不含中文测试方法名（非 ASCII 方法名会在 LANG=C 下让 Kotlin
+  编译守护进程生成非法类文件路径而崩，详见 HANDOVER）
+- `HongguoSignTest`（3）：X-Gorgon 签名向量
 - `HotRankerTest`（6）：本地热度打分与排序稳定性
-- `LiveNetworkTest`（2）：打真实服务器，验证内置源能拿到可播 m3u8、聚合搜索有结果
+- `LiveNetworkTest`（4）：打真实服务器，验证内置 macCMS 源可播 m3u8、红果列表→详情分集→取流闭环、
+  红果网页搜索与聚合搜索有结果
   - 依赖源站可用性与出口 IP（机房 IP 常被 403），CI 用 `-PskipLiveNetworkTests` 跳过，本地默认执行
 
 ## 已知限制

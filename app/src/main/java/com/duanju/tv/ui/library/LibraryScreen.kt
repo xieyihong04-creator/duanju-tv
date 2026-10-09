@@ -184,6 +184,7 @@ private fun FavoritesContent(
             score = "",
             updated = "",
             playGroups = emptyList(),
+            backendId = entry.backendId,
         )
     }
     LazyVerticalGrid(
@@ -345,6 +346,7 @@ private fun HistoryContent(
                             score = "",
                             updated = "",
                             playGroups = emptyList(),
+                            backendId = entry.backendId,
                         )
                         onDramaClick(minimal)
                     }

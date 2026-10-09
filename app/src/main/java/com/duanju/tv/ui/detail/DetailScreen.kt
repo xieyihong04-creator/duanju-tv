@@ -280,7 +280,11 @@ fun DetailScreen(
                 if (episodes.isEmpty()) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text(
-                            text = "这部剧没有可播放的分集，请换一条线路或返回重新选择",
+                            text = when {
+                                state.loadingEpisodes -> "正在加载分集…"
+                                state.episodeError.isNotBlank() -> "分集加载失败：${state.episodeError}"
+                                else -> "这部剧没有可播放的分集，请换一条线路或返回重新选择"
+                            },
                             color = tvColors().onSurfaceVariant,
                             fontSize = 15.scaledSp(),
                         )

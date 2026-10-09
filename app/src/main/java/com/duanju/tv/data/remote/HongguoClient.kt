@@ -1,15 +1,12 @@
 package com.duanju.tv.data.remote
 
 import com.duanju.tv.data.model.Drama
-import com.duanju.tv.data.model.Episode
 import com.duanju.tv.data.model.PlayGroup
 import com.duanju.tv.data.model.Resolved
 import com.duanju.tv.data.model.SearchPage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.int
@@ -91,15 +88,18 @@ class HongguoClient(private val http: OkHttpClient) {
             throw IOException("红果搜索数据不可用")
         }
 
-        val items = anyList(pageData["recommendList"])
-        val dramas = items.mapNotNull { parseDramaFromCategoryItem(it) }
-        val pages = pageData["pagination"]?.let { (it as JsonObject).intOrNull("totalPages") } ?: 1
+        // 搜索页字段和分类页不同名：结果在 searchList，总数在 totalCount（无 pagination）
+        val items = jsonList(pageData["searchList"] ?: pageData["recommendList"])
+        val dramas = items.mapNotNull { hongguoDramaFromItem(it as? JsonObject ?: return@mapNotNull null) }
+            .distinctBy { it.backendId ?: it.id }
+        if (items.isNotEmpty() && dramas.isEmpty()) throw IOException("红果搜索结果中没有可识别的剧集")
+        val total = pageData.intOrNull("totalCount") ?: items.size
 
         SearchPage(
             items = dramas,
             page = page,
-            pageCount = pages,
-            total = items.size,
+            pageCount = if (total > dramas.size) page + 1 else page,
+            total = maxOf(total, dramas.size),
         )
     }
 
@@ -113,43 +113,21 @@ class HongguoClient(private val http: OkHttpClient) {
         val detail = pageData?.getJsonObject("seriesDetail")
             ?: throw IOException("红果详情数据为空")
 
-        val seriesIdStr = detail.strOrNull("series_id_str") ?: detail.strOrNull("series_id") ?: seriesId
-        val title = detail.strOrNull("series_title") ?: detail.strOrNull("series_name") ?: detail.strOrNull("name") ?: seriesIdStr
-        val cover = detail.strOrNull("series_cover") ?: detail.strOrNull("cover") ?: ""
-        val intro = detail.strOrNull("series_intro") ?: detail.strOrNull("video_desc") ?: ""
-        val count = detail.strOrNull("episode_cnt") ?: ""
-        val remark = detail.strOrNull("episode_right_text") ?: (if (count.isNotBlank()) "共${count}集" else "")
-        val score = detail.strOrNull("score") ?: ""
-        val playCount = detail.strOrNull("series_play_cnt") ?: detail.strOrNull("play_cnt") ?: ""
+        // 剧壳字段与分类页、App 通道同构，共用一个映射，避免三处各写一遍字段表
+        val base = hongguoDramaFromItem(detail, categoryFallback = "短剧")
+            ?: throw IOException("红果详情缺少 series_id")
 
-        val vidList = anyList(detail["vid_list"])
-        val episodes = vidList.mapIndexed { idx, v ->
-            val vid = (v as? JsonPrimitive)?.content?.trim() ?: v.toString().trim()
-            if (vid.isEmpty() || vid == "<nil>" || !vid.matches(Regex("^\\d+$"))) return@mapIndexed null
-            Episode(idx + 1, "第${idx + 1}集", "hongguo://$seriesIdStr/$vid")
-        }.filterNotNull()
+        // vid_list 两种形态都见过：纯 vid 字符串数组，或带 vid/vid_index 的对象数组
+        val episodes = parseHongguoVidList(detail["vid_list"], base.backendId ?: seriesId)
+        if (episodes.isEmpty()) throw IOException("红果详情没有返回剧集 ID")
 
-        val playGroup = PlayGroup("红果官方", episodes)
-
-        Drama(
-            id = seriesIdStr.toIntOrNull() ?: seriesIdStr.hashCode(),
-            sourceId = "hongguo",
-            name = title,
-            pic = cover,
-            type = detail.strOrNull("category_name") ?: detail.strOrNull("categoryName") ?: detail.strOrNull("category") ?: "短剧",
-            typeId = 0,
-            remarks = remark,
-            year = "",
-            area = "",
-            director = "",
-            actors = "",
-            blurb = intro,
-            detail = intro,
-            tag = "",
-            score = score,
+        base.copy(
+            playGroups = listOf(PlayGroup(HONGGUO_GROUP_NAME, episodes)),
+            remarks = base.remarks.ifBlank {
+                val count = detail.strOrNull("episode_cnt")
+                if (count != null) "共${count}集" else ""
+            },
             updated = "",
-            playGroups = listOf(playGroup),
-            backendId = seriesIdStr,
         )
     }
 
@@ -174,20 +152,38 @@ class HongguoClient(private val http: OkHttpClient) {
         val info = pageData.getJsonObject("video_player_info")
             ?: throw IOException("红果该集未提供公开播放地址")
 
-        val addresses = extractMediaAddresses(info)
-        if (addresses.isEmpty()) {
+        // 与 App 通道共用取址逻辑：网页给的是 base64 形态的 main_url，且要过滤加密流
+        val clear = extractClearAddresses(info)
+        if (clear.isEmpty()) {
             throw IOException("红果该集未提供公开播放地址，可能需要登录或 App 授权")
         }
 
-        val duration = info.doubleOrNull("duration") ?: 0.0
-        val mediaUrl = addresses[0]
-        val headers = mapOf(
-            "User-Agent" to UA,
-            "Referer" to referer,
-            "Origin" to baseUrl,
+        Resolved.Direct(
+            clear[0],
+            mapOf(
+                "User-Agent" to UA,
+                "Referer" to referer,
+                "Origin" to baseUrl,
+            ),
         )
+    }
 
-        Resolved.Direct(mediaUrl, headers)
+    /**
+     * video_player_info 结构比 App 通道扁平（直接是 main_url/duration），
+     * 但地址同样是 base64，也可能带 encrypt_info。走一遍明流筛选。
+     */
+    private fun extractClearAddresses(info: JsonObject): List<String> {
+        if (info.getJsonArray("video_list") != null || info.getJsonObject("video_model") != null) {
+            val model = parseVideoModel(info) ?: info
+            val url = selectClearStream(videoModelVariants(model))
+            return listOfNotNull(url)
+        }
+        val enc = info.getJsonObject("encrypt_info")
+        if (enc != null && (enc.strOrNull("spade_a")?.isNotBlank() == true ||
+                enc.strOrNull("encryption_method") == "cenc-aes-ctr")) {
+            return emptyList()
+        }
+        return extractMediaAddresses(info)
     }
 
     // ========== 内部解析方法 ==========
@@ -266,20 +262,6 @@ class HongguoClient(private val http: OkHttpClient) {
         return null
     }
 
-    private fun anyList(v: JsonElement?): List<JsonElement> {
-        return when (v) {
-            is JsonArray -> v.toList()
-            is JsonObject -> {
-                for (key in listOf("list", "items", "data")) {
-                    val arr = v[key] as? JsonArray
-                    if (arr != null) return arr.toList()
-                }
-                emptyList()
-            }
-            else -> emptyList()
-        }
-    }
-
     private suspend fun fetchCategoryPage(route: String, category: String, page: Int): Pair<List<Drama>, Int> {
         val url = "$baseUrl/category/$route?page=$page"
         val body = fetchHtml(url)
@@ -290,113 +272,12 @@ class HongguoClient(private val http: OkHttpClient) {
             throw IOException("红果分类数据不可用")
         }
 
-        val items = anyList(pageData["recommendList"])
-        val dramas = items.mapNotNull { parseDramaFromCategoryItem(it, category) }
+        val items = jsonList(pageData["recommendList"])
+        // 与 App 通道共用一套字段映射，网页条目多出 video_data 包裹层也能识别
+        val dramas = items.mapNotNull { hongguoDramaFromItem(it as? JsonObject ?: return@mapNotNull null, category) }
         val pages = pageData["pagination"]?.let { (it as JsonObject).intOrNull("totalPages") } ?: 1
 
         return dramas to pages
-    }
-
-    private fun parseDramaFromCategoryItem(item: JsonElement, category: String = ""): Drama? {
-        val m = item as? JsonObject ?: return null
-        val vd = m.getJsonObject("video_data") ?: m
-
-        val seriesId = vd.strOrNull("series_id_str") ?: vd.strOrNull("series_id")
-            ?: m.strOrNull("series_id_str") ?: m.strOrNull("series_id")
-            ?: vd.strOrNull("keyword") ?: m.strOrNull("keyword")
-            ?: return null
-
-        if (!seriesId.matches(Regex("^\\d+$"))) return null
-
-        val title = vd.strOrNull("series_title") ?: vd.strOrNull("series_name") ?: vd.strOrNull("title")
-            ?: m.strOrNull("series_name") ?: m.strOrNull("name") ?: seriesId
-        val cover = vd.strOrNull("series_cover") ?: vd.strOrNull("cover")
-            ?: m.strOrNull("series_cover") ?: ""
-        val intro = vd.strOrNull("series_intro") ?: vd.strOrNull("video_desc")
-            ?: m.strOrNull("series_intro") ?: ""
-        val count = vd.strOrNull("episode_cnt") ?: m.strOrNull("episode_cnt") ?: ""
-        val remark = vd.strOrNull("episode_right_text") ?: m.strOrNull("episode_right_text")
-            ?: (if (count.isNotBlank()) "共${count}集" else "")
-        val score = vd.strOrNull("score") ?: ""
-        val playCount = vd.strOrNull("series_play_cnt") ?: vd.strOrNull("play_cnt") ?: ""
-
-        // 状态
-        val status = vd.strOrNull("series_status")
-        val releaseStatus = when (status) {
-            "1" -> "finished"
-            "0" -> "ongoing"
-            else -> ""
-        }
-
-        // 标签
-        val tags = mutableListOf<String>()
-        val tagStr = vd.strOrNull("tags")
-        if (tagStr?.isNotBlank() == true) {
-            tags.addAll(tagStr.split(",").map { it.trim() }.filter { it.isNotBlank() })
-        }
-        val categoryList = anyList(vd["category_list"])
-        for (cat in categoryList) {
-            val name = (cat as? JsonObject)?.strOrNull("name")
-            if (name?.isNotBlank() == true && name !in tags) tags.add(name)
-        }
-
-        val genre = vd.strOrNull("category_name") ?: vd.strOrNull("categoryName") ?: vd.strOrNull("category") ?: category
-
-        return Drama(
-            id = seriesId.toIntOrNull() ?: seriesId.hashCode(),
-            sourceId = "hongguo",
-            name = title,
-            pic = cover,
-            type = genre,
-            typeId = 0,
-            remarks = remark,
-            year = "",
-            area = "",
-            director = "",
-            actors = "",
-            blurb = intro,
-            detail = intro,
-            tag = tags.joinToString(","),
-            score = score,
-            updated = "",
-            playGroups = listOf(PlayGroup("红果官方", emptyList())), // 详情页再填充剧集
-            backendId = seriesId,
-        )
-    }
-
-    private fun extractMediaAddresses(info: JsonObject): List<String> {
-        val addresses = mutableSetOf<String>()
-        val candidates = setOf(
-            "main_url", "url", "play_url", "video_url", "m3u8_url",
-            "hls_url", "dash_url", "mp4_url"
-        )
-
-        fun collectUrls(element: JsonElement?) {
-            when (element) {
-                is JsonObject -> {
-                    for (key in element.keys) {
-                        if (key in candidates) {
-                            val v = element.strOrNull(key)
-                            if (v?.isNotBlank() == true && v.startsWith("http")) addresses.add(v)
-                        }
-                        collectUrls(element[key])
-                    }
-                }
-                is JsonArray -> {
-                    for (item in element) collectUrls(item)
-                }
-                else -> {}
-            }
-        }
-
-        collectUrls(info)
-        return addresses.toList()
-    }
-
-    private fun JsonObject.strOrNull(key: String): String? {
-        val p = this[key] as? JsonPrimitive ?: return null
-        val content = p.content
-        return if (content == "null") null else content.takeIf { it.isNotBlank() }
     }
 
     private fun JsonObject.booleanOrNull(key: String): Boolean? {
@@ -415,14 +296,5 @@ class HongguoClient(private val http: OkHttpClient) {
             ?: p.content.toIntOrNull()
     }
 
-    private fun JsonObject.doubleOrNull(key: String): Double? {
-        val p = this[key] as? JsonPrimitive ?: return null
-        return runCatching { p.content.toDouble() }.getOrNull()
-    }
-
-    private fun JsonObject.getJsonObject(key: String): JsonObject? = this[key] as? JsonObject
-
     private fun JsonObject.isNotEmpty(): Boolean = keys.isNotEmpty()
-
-    private fun JsonArray.toList(): List<JsonElement> = (0 until size).map { get(it) }
 }

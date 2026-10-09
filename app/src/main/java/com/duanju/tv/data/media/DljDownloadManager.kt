@@ -106,8 +106,13 @@ object DljDownloadManager {
             l.sourceId, l.dramaId.toString(), l.rawEpisodeUrl,
         ).joinToString("\u0001").toByteArray(Charsets.UTF_8)
 
-    fun downloadId(sourceId: String, dramaId: Int, episodeIndex: Int): String =
-        "$sourceId#$dramaId#$episodeIndex"
+    /**
+     * 任务 id 直接用 [com.duanju.tv.data.model.Drama.key] 拼集数。
+     *
+     * 之前用 drama.id：红果的 id 是 series_id 的散列值，而取消/进度统计按
+     * drama.key（含 backendId）比对，两边永远对不上，取消任务与「已缓存几集」都会失效。
+     */
+    fun downloadId(dramaKey: String, episodeIndex: Int): String = "$dramaKey#$episodeIndex"
 
     /**
      * 加入缓存任务。
@@ -119,7 +124,7 @@ object DljDownloadManager {
         episode: Episode,
         playUrl: String,
     ): String {
-        val id = downloadId(drama.sourceId, drama.id, episode.index)
+        val id = downloadId(drama.key, episode.index)
         val label = DownloadLabel(
             dramaKey = drama.key,
             dramaName = drama.name,

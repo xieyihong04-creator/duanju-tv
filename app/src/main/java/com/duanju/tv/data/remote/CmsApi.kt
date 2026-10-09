@@ -6,6 +6,7 @@ import com.duanju.tv.data.model.Episode
 import com.duanju.tv.data.model.PlayGroup
 import com.duanju.tv.data.model.Resolved
 import com.duanju.tv.data.model.SearchPage
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -32,9 +33,9 @@ enum class SourceKind {
 }
 
 /**
- * 一个 CMS(macCMS 风格) 聚合站点。
+ * 一个 CMS(macCMS 风格) 聚合站点，或红果这类需要专用客户端的源。
  *
- * 短剧在各站点都是一个独立分类（如 ffzy 的 type_id=36、bfzy 的 58），
+ * 短剧在各 CMS 站点都是一个独立分类（如 ffzy 的 type_id=36、bfzy 的 58），
  * 这里通过 ac=list 自动发现分类，而不是写死 id，避免站点调整后失效。
  */
 data class SourceSpec(
@@ -48,6 +49,9 @@ data class SourceSpec(
     val kind: SourceKind = SourceKind.MAC_CMS,
 ) {
     val isAggregate: Boolean get() = id == AGGREGATE_ID
+
+    /** 只有 macCMS 站点有「分类 id」概念；红果走 App/网页接口，ac=list 永远为空 */
+    val hasMacCategories: Boolean get() = kind == SourceKind.MAC_CMS && listApi.isNotBlank()
 
     companion object {
         const val AGGREGATE_ID = "aggregate"
@@ -377,15 +381,48 @@ class DramaRepository(
     private companion object {
         const val PER_PAGE = 50
         const val PAGES_TO_SCAN = 6
+
+        /** App 通道详情/取流判死后，多久之内不再尝试 */
+        const val APP_MEDIA_COOLDOWN_MS = 30 * 60 * 1000L
     }
 
     /** 源 id -> 短剧分类 id 列表，进程内缓存 */
     private val catCache = java.util.concurrent.ConcurrentHashMap<String, List<Int>>()
 
-    suspend fun dramaCategoryIds(spec: SourceSpec): List<Int> =
-        catCache.getOrPut(spec.id) {
+    /**
+     * 红果 landpage 是游标制分页，接口不认页码。
+     * 这里按源记住「下一次要用的游标」，调用方仍然是按 page=1,2,3… 顺序取页。
+     * page=1 视为重新开始（首页刷新、切源都回到第一页）。
+     */
+    private val hongguoCursor = java.util.concurrent.ConcurrentHashMap<String, LandpageCursor?>()
+
+    /** 红果剧集详情缓存（series_id -> Drama 含分集），避免每次进详情都打两次接口 */
+    private val hongguoDetailCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Drama, Long>>()
+
+    /**
+     * 红果 App 通道的详情/取流冷却截止时间。
+     *
+     * landpage 能正常返回，但 video_detail / video_model 对未注册过的 device_id
+     * 会给 200 空 body 或业务码 110001（实测）。这类失败重试无用，
+     * 判死一段时间，详情页和播放直接走网页通道，不再每次白等三轮退避。
+     */
+    @Volatile
+    private var hongguoAppMediaCooldownUntil: Long = 0L
+
+    /**
+     * 最近一次红果列表实际走的通道（app / web）。
+     * 「翻页静默回退网页」是这里最难发现的问题，留个口子给测试和日志确认。
+     */
+    internal var lastHongguoListChannel: String = "none"
+        private set
+
+    suspend fun dramaCategoryIds(spec: SourceSpec): List<Int> {
+        // 红果没有 macCMS 的 ac=list，硬调只会拿到空表并把它缓存住
+        if (!spec.hasMacCategories) return emptyList()
+        return catCache.getOrPut(spec.id) {
             runCatching { cms.dramaCategoryIds(spec) }.getOrDefault(emptyList())
         }
+    }
 
     suspend fun page(spec: SourceSpec, page: Int): SearchPage = withContext(Dispatchers.IO) {
         if (spec.isAggregate) aggregatePage(page) else singlePage(spec, page)
@@ -393,29 +430,7 @@ class DramaRepository(
 
     private suspend fun singlePage(spec: SourceSpec, page: Int): SearchPage {
         return when (spec.kind) {
-            SourceKind.HONGGUO -> {
-                // App 通道优先：landpage(cursor)，cursor 用 page 编码（首页 page=1 传 null）
-                val cursor = if (page == 1) null else page.toString()
-                try {
-                    val (dramas, nextCursor) = hongguoApp.landpage(cursor)
-                    if (dramas.isNotEmpty()) {
-                        SearchPage(
-                            items = dramas,
-                            page = page,
-                            pageCount = if (nextCursor != null) page + 1 else page,
-                            total = dramas.size,
-                        )
-                    } else {
-                        // App 返回空，回退网页版
-                        android.util.Log.w("DramaRepository", "红果 App landpage 返回空，回退网页版 page=$page")
-                        hongguo.page(page)
-                    }
-                } catch (e: Exception) {
-                    // App 失败，回退网页版
-                    android.util.Log.w("DramaRepository", "红果 App landpage 失败: ${e.message}，回退网页版 page=$page")
-                    hongguo.page(page)
-                }
-            }
+            SourceKind.HONGGUO -> hongguoPage(spec, page)
             SourceKind.MAC_CMS -> {
                 val cats = dramaCategoryIds(spec)
                 if (cats.isEmpty()) cms.latest(spec, page)
@@ -434,6 +449,94 @@ class DramaRepository(
             }
         }
     }
+
+    /**
+     * 红果列表：App 通道优先，失败/到底回退网页通道。
+     *
+     * 网页通道是分页号语义、App 通道是游标语义，两者混在一个源上：
+     * 只要还有可用游标就走 App，没有就走网页的分页号。
+     */
+    private suspend fun hongguoPage(spec: SourceSpec, page: Int): SearchPage {
+        if (page <= 1) hongguoCursor.remove(spec.id)
+        val cursor = if (page <= 1) null else hongguoCursor[spec.id]
+        if (page > 1 && cursor == null) {
+            // App 通道不可用或已经到底，交给网页通道按分页号继续
+            lastHongguoListChannel = "web"
+            return hongguo.page(page)
+        }
+
+        try {
+            val (dramas, next) = hongguoApp.landpage(cursor)
+            if (next != null) hongguoCursor[spec.id] = next else hongguoCursor.remove(spec.id)
+            if (dramas.isNotEmpty()) {
+                lastHongguoListChannel = "app"
+                return SearchPage(
+                    items = dramas,
+                    page = page,
+                    pageCount = if (next != null) page + 1 else page,
+                    total = page * dramas.size,
+                )
+            }
+            Log.w(TAG, "红果 App landpage 第 $page 页为空，回退网页版")
+        } catch (e: Exception) {
+            Log.w(TAG, "红果 App landpage 失败(${e.message})，回退网页版 page=$page")
+            hongguoCursor.remove(spec.id)
+        }
+        val web = hongguo.page(page)
+        lastHongguoListChannel = "web"
+        return web
+    }
+
+    /**
+     * 列表条目只有元信息、没有分集（红果 landpage / 网页 category 都只给剧壳）。
+     * 进详情时补齐：App 通道优先，失败回退网页通道。
+     *
+     * App 通道只有 landpage 是公开可用的；video_detail / video_model 在没有注册过的
+     * device_id 上固定返回 200 空 body 或业务码 110001（实测）。这种失败重试不会变好，
+     * 所以用 [hongguoAppMediaCooldownUntil] 冷却一段时间，直接走网页通道。
+     */
+    suspend fun withEpisodes(drama: Drama): Drama {
+        if (drama.playGroups.any { it.episodes.isNotEmpty() }) return drama
+        val seriesId = drama.backendId ?: return drama
+        if (drama.sourceId != "hongguo") return drama
+
+        cachedDetail(seriesId)?.let { return mergeDetail(drama, it) }
+
+        val app = if (appMediaCoolingDown()) {
+            Result.failure(IOException("红果 App 详情通道冷却中"))
+        } else {
+            runCatching { hongguoApp.videoDetail(seriesId) }.onSuccess { hongguoAppMediaCooldownUntil = 0L }
+        }
+        val fetched = app.getOrElse { e ->
+            if (e is PermanentAppError) openAppMediaCooldown()
+            Log.w(TAG, "红果 App 详情失败(${e.message})，回退网页版 series=$seriesId")
+            runCatching { hongguo.detail(seriesId) }.getOrNull()
+        }
+            ?: return drama
+        hongguoDetailCache[seriesId] = fetched to System.currentTimeMillis() + DETAIL_TTL_MS
+        return mergeDetail(drama, fetched)
+    }
+
+    private fun cachedDetail(seriesId: String): Drama? {
+        val (drama, expiresAt) = hongguoDetailCache[seriesId] ?: return null
+        if (System.currentTimeMillis() > expiresAt) {
+            hongguoDetailCache.remove(seriesId)
+            return null
+        }
+        return drama
+    }
+
+    private fun appMediaCoolingDown(): Boolean = System.currentTimeMillis() < hongguoAppMediaCooldownUntil
+
+    private fun openAppMediaCooldown() {
+        hongguoAppMediaCooldownUntil = System.currentTimeMillis() + APP_MEDIA_COOLDOWN_MS
+    }
+
+    /** 列表项的元信息更丰富（tags/演员等），补进来的只有分集，所以保留原条目、只换 playGroups */
+    private fun mergeDetail(listItem: Drama, detail: Drama): Drama =
+        if (detail.playGroups.any { it.episodes.isNotEmpty() })
+            listItem.copy(playGroups = detail.playGroups, remarks = listItem.remarks.ifBlank { detail.remarks })
+        else listItem
 
     private suspend fun aggregatePage(page: Int): SearchPage = coroutineScope {
         val jobs = DefaultSources.ALL.filter { it.enabled }.map { spec ->
@@ -470,9 +573,11 @@ class DramaRepository(
             if (!spec.isAggregate) {
                 return@withContext when (spec.kind) {
                     SourceKind.HONGGUO -> {
-                        // 红果 App 搜索暂不支持，回退网页版
-                        android.util.Log.w("DramaRepository", "红果 App 搜索暂不支持，回退网页版 keyword=$keyword page=$page")
-                        hongguo.search(keyword, page)
+                        // App 通道没有搜索接口，走网页版
+                        runCatching { hongguo.search(keyword, page) }.getOrElse {
+                            Log.w(TAG, "红果网页搜索失败(${it.message})")
+                            SearchPage(emptyList(), page, 1, 0)
+                        }
                     }
                     SourceKind.MAC_CMS -> {
                         val cats = dramaCategoryIds(spec)
@@ -537,19 +642,21 @@ class DramaRepository(
             if (parts.size == 2) {
                 val seriesId = parts[0]
                 val vid = parts[1]
-                // 先尝试 App 通道 videoModel
-                try {
-                    return@withContext hongguoApp.videoModel(seriesId, vid)
-                } catch (e: IOException) {
-                    android.util.Log.w("DramaRepository", "红果 App videoModel 失败: ${e.message}，回退网页版 resolve seriesId=$seriesId vid=$vid")
-                    // 回退网页版
-                    try {
-                        return@withContext hongguo.resolve(seriesId, vid)
-                    } catch (e2: IOException) {
-                        return@withContext Resolved.Failed(e2.message ?: "红果解析失败")
-                    }
+                // App 通道的失败形态不只 IOException（签名/解析都可能抛别的），
+                // 只 catch IOException 会把异常直接抛给播放器协程
+                val app = if (appMediaCoolingDown()) {
+                    Result.failure(IOException("红果 App 取流通道冷却中"))
+                } else {
+                    runCatching { hongguoApp.videoModel(seriesId, vid) }
+                        .onSuccess { hongguoAppMediaCooldownUntil = 0L }
                 }
+                if (app.isSuccess) return@withContext app.getOrThrow()
+                if (app.exceptionOrNull() is PermanentAppError) openAppMediaCooldown()
+                Log.w(TAG, "红果 App 取流失败(${app.exceptionOrNull()?.message})，回退网页版 $seriesId/$vid")
+                return@withContext runCatching { hongguo.resolve(seriesId, vid) }
+                    .getOrElse { Resolved.Failed(it.message ?: "红果解析失败") }
             }
+            return@withContext Resolved.Failed("红果剧集地址格式异常: ${episode.rawUrl}")
         }
         resolver.resolve(episode)
     }
@@ -568,3 +675,6 @@ class DramaRepository(
         return sorted.firstOrNull() to Resolved.Failed(lastMessage)
     }
 }
+
+private const val TAG = "DramaRepository"
+private const val DETAIL_TTL_MS = 5 * 60 * 1000L

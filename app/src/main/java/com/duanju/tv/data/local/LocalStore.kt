@@ -80,6 +80,7 @@ class LocalStore private constructor(context: Context) {
                     remarks = drama.remarks,
                     addedAt = System.currentTimeMillis(),
                     drama = drama,
+                    backendId = drama.backendId,
                 ),
             ) + _favorites.value
         }
@@ -113,6 +114,7 @@ class LocalStore private constructor(context: Context) {
             durationMs = durationMs.coerceAtLeast(0),
             updatedAt = System.currentTimeMillis(),
             drama = drama,
+            backendId = drama.backendId,
         )
         val list = (listOf(entry) + _history.value.filterNot { it.key == drama.key }).take(MAX_HISTORY)
         _history.set(list)
