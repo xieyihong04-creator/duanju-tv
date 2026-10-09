@@ -44,7 +44,9 @@ jobs:
         run: |
           APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
           echo "Verifying: $APK"
-          apksigner verify --print-certs "$APK"
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          echo "Using: $APKSIGNER"
+          "$APKSIGNER" verify --print-certs "$APK"
 
       - name: Create GitHub Release
         env:
