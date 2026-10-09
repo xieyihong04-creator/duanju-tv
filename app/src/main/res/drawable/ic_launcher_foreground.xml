@@ -1,0 +1,29 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Rounded dark background square (72x72 centered in 108x108) -->
+    <path
+        android:fillColor="#FF15151C"
+        android:pathData="M24,24 h60 a6,6 0 0,1 6,6 v48 a6,6 0 0,1 -6,6 h-60 a6,6 0 0,1 -6,-6 v-48 a6,6 0 0,1 6,-6 z" />
+
+    <!-- Film strip perforations - left side -->
+    <path
+        android:fillColor="#FFFF5C7A"
+        android:alpha="0.3"
+        android:pathData="M26,30 h4 v6 h-4 z M26,40 h4 v6 h-4 z M26,50 h4 v6 h-4 z M26,60 h4 v6 h-4 z M26,70 h4 v6 h-4 z" />
+
+    <!-- Film strip perforations - right side -->
+    <path
+        android:fillColor="#FFFF5C7A"
+        android:alpha="0.3"
+        android:pathData="M78,30 h4 v6 h-4 z M78,40 h4 v6 h-4 z M78,50 h4 v6 h-4 z M78,60 h4 v6 h-4 z M78,70 h4 v6 h-4 z" />
+
+    <!-- Play triangle -->
+    <path
+        android:fillColor="#FFFF5C7A"
+        android:pathData="M46,40 L46,68 L68,54 Z" />
+
+</vector>

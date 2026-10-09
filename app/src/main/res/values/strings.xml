@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">短剧TV</string>
+    <string name="tab_home">首页</string>
+    <string name="tab_category">分类</string>
+    <string name="tab_search">搜索</string>
+    <string name="tab_library">我的</string>
+    <string name="tab_settings">设置</string>
+    <string name="play">播放</string>
+    <string name="resume_play">继续播放</string>
+    <string name="favorite_add">收藏</string>
+    <string name="favorite_remove">取消收藏</string>
+    <string name="cache_all">缓存全剧</string>
+    <string name="loading">加载中…</string>
+    <string name="empty">暂无内容</string>
+    <string name="error_network">加载失败，请检查网络</string>
+    <string name="retry">重试</string>
+    <string name="notification_channel_playback">播放</string>
+    <string name="notification_channel_download">缓存</string>
+</resources>

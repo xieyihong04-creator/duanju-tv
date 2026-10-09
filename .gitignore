@@ -1,0 +1,17 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+.kotlin/
+local.properties
+
+# 签名凭据：切勿提交
+keystore.properties
+*.jks
+*.keystore
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+captures/
