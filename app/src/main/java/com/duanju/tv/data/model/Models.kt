@@ -25,11 +25,13 @@ data class Drama(
     val updated: String,
     /** 线路 -> 剧集列表，保留多线路以便切换源 */
     val playGroups: List<PlayGroup>,
+    /** 后端真实 ID（如红果 series_id），用于区分同一 sourceId 下的不同 ID 空间；默认 null 兼容旧收藏 */
+    val backendId: String? = null,
 ) {
     val episodeCount: Int get() = playGroups.maxOfOrNull { it.episodes.size } ?: 0
 
-    /** 同一部剧在聚合源中的唯一键 */
-    val key: String get() = "$sourceId#$id"
+    /** 同一部剧在聚合源中的唯一键：优先用 backendId，回落到 id */
+    val key: String get() = "$sourceId#${backendId ?: id}"
 
     val bestGroup: PlayGroup? get() = playGroups.maxByOrNull { it.episodes.size }
 

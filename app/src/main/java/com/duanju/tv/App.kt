@@ -6,6 +6,7 @@ import com.duanju.tv.data.local.LocalStore
 import com.duanju.tv.data.media.PlayerFactory
 import com.duanju.tv.data.remote.CmsClient
 import com.duanju.tv.data.remote.DramaRepository
+import com.duanju.tv.data.remote.HongguoClient
 import com.duanju.tv.data.remote.SharePageResolver
 import com.duanju.tv.data.remote.buildOkHttp
 import okhttp3.Cache
@@ -40,7 +41,9 @@ class AppGraph(context: Context) {
 
     val resolver: SharePageResolver = SharePageResolver(http)
 
-    val repository: DramaRepository = DramaRepository(cms, resolver)
+    val hongguo: HongguoClient = HongguoClient(http)
+
+    val repository: DramaRepository = DramaRepository(cms, resolver, hongguo)
 
     val playerFactory: PlayerFactory = PlayerFactory(context)
 }

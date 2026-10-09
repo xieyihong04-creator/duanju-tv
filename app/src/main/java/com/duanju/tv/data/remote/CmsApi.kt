@@ -24,6 +24,14 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
+ * 数据源类型：区分 macCMS 风格与红果网页通道
+ */
+enum class SourceKind {
+    MAC_CMS,
+    HONGGUO
+}
+
+/**
  * 一个 CMS(macCMS 风格) 聚合站点。
  *
  * 短剧在各站点都是一个独立分类（如 ffzy 的 type_id=36、bfzy 的 58），
@@ -36,6 +44,8 @@ data class SourceSpec(
     /** 可作为该源短剧主分类的候选名称关键字 */
     val dramaKeywords: List<String> = listOf("短剧"),
     val enabled: Boolean = true,
+    /** 数据源类型，决定解析逻辑 */
+    val kind: SourceKind = SourceKind.MAC_CMS,
 ) {
     val isAggregate: Boolean get() = id == AGGREGATE_ID
 
@@ -55,6 +65,12 @@ object DefaultSources {
             id = "bfzy",
             name = "暴风·短剧",
             listApi = "https://bfzyapi.com/api.php/provide/vod/",
+        ),
+        SourceSpec(
+            id = "hongguo",
+            name = "红果·短剧",
+            listApi = "https://hongguoduanju.com",
+            kind = SourceKind.HONGGUO,
         ),
     )
 
@@ -354,6 +370,7 @@ class SharePageResolver(private val http: OkHttpClient) {
 class DramaRepository(
     private val cms: CmsClient,
     private val resolver: SharePageResolver,
+    private val hongguo: HongguoClient,
 ) {
 
     private companion object {
@@ -374,16 +391,25 @@ class DramaRepository(
     }
 
     private suspend fun singlePage(spec: SourceSpec, page: Int): SearchPage {
-        val cats = dramaCategoryIds(spec)
-        if (cats.isEmpty()) return cms.latest(spec, page)
-        val results = coroutineScope {
-            cats.take(2).map { c -> async { runCatching { cms.detail(spec, c, page) }.getOrNull() } }
-                .mapNotNull { it.await() }
+        return when (spec.kind) {
+            SourceKind.HONGGUO -> hongguo.page(page)
+            SourceKind.MAC_CMS -> {
+                val cats = dramaCategoryIds(spec)
+                if (cats.isEmpty()) cms.latest(spec, page)
+                else {
+                    val results = coroutineScope {
+                        cats.take(2).map { c -> async { runCatching { cms.detail(spec, c, page) }.getOrNull() } }
+                            .mapNotNull { it.await() }
+                    }
+                    if (results.isEmpty()) cms.latest(spec, page)
+                    else {
+                        val first = results.first()
+                        val items = results.flatMap { it.items }.distinctBy { it.sourceId to it.id }
+                        SearchPage(items, page, first.pageCount, results.sumOf { it.total })
+                    }
+                }
+            }
         }
-        if (results.isEmpty()) return cms.latest(spec, page)
-        val first = results.first()
-        val items = results.flatMap { it.items }.distinctBy { it.sourceId to it.id }
-        return SearchPage(items, page, first.pageCount, results.sumOf { it.total })
     }
 
     private suspend fun aggregatePage(page: Int): SearchPage = coroutineScope {
@@ -392,7 +418,7 @@ class DramaRepository(
         }
         val pages = jobs.mapNotNull { it.await() }
         SearchPage(
-            items = interleave(pages.flatMap { it.items }).distinctBy { it.sourceId to it.id },
+            items = interleave(pages.flatMap { it.items }).distinctBy { it.key },
             page = page,
             pageCount = if (pages.isEmpty()) 1 else pages.maxOf { it.pageCount },
             total = pages.sumOf { it.total },
@@ -419,20 +445,26 @@ class DramaRepository(
     suspend fun search(spec: SourceSpec, keyword: String, page: Int): SearchPage =
         withContext(Dispatchers.IO) {
             if (!spec.isAggregate) {
-                val cats = dramaCategoryIds(spec)
-                val remote = runCatching { cms.search(spec, keyword, page) }.getOrNull()
-                if (cats.isNotEmpty() && (remote == null || remote.items.isEmpty())) {
-                    // 搜索接口对短剧分类覆盖不全时，用分类列表做包含匹配兜底
-                    return@withContext fallbackSearch(spec, cats, keyword, page)
+                return@withContext when (spec.kind) {
+                    SourceKind.HONGGUO -> hongguo.search(keyword, page)
+                    SourceKind.MAC_CMS -> {
+                        val cats = dramaCategoryIds(spec)
+                        val remote = runCatching { cms.search(spec, keyword, page) }.getOrNull()
+                        if (cats.isNotEmpty() && (remote == null || remote.items.isEmpty())) {
+                            // 搜索接口对短剧分类覆盖不全时，用分类列表做包含匹配兜底
+                            fallbackSearch(spec, cats, keyword, page)
+                        } else {
+                            remote ?: SearchPage(emptyList(), page, 1, 0)
+                        }
+                    }
                 }
-                return@withContext remote ?: SearchPage(emptyList(), page, 1, 0)
             }
             val jobs = DefaultSources.ALL.filter { it.enabled }.map { s ->
                 async { runCatching { search(s, keyword, page) }.getOrNull() }
             }
             val pages = jobs.mapNotNull { it.await() }
             SearchPage(
-                pages.flatMap { it.items }.distinctBy { it.sourceId to it.id },
+                pages.flatMap { it.items }.distinctBy { it.key },
                 page,
                 if (pages.isEmpty()) 1 else pages.maxOf { it.pageCount },
                 pages.sumOf { it.total },
@@ -471,15 +503,28 @@ class DramaRepository(
         )
     }
 
-    suspend fun resolveEpisode(episode: Episode): Resolved = resolver.resolve(episode)
+    suspend fun resolveEpisode(episode: Episode): Resolved = withContext(Dispatchers.IO) {
+        // hongguo://series/vid 格式走 HongguoClient，其它走 SharePageResolver
+        if (episode.rawUrl.startsWith("hongguo://")) {
+            val parts = episode.rawUrl.removePrefix("hongguo://").split("/")
+            if (parts.size == 2) {
+                try {
+                    return@withContext hongguo.resolve(parts[0], parts[1])
+                } catch (e: IOException) {
+                    return@withContext Resolved.Failed(e.message ?: "红果解析失败")
+                }
+            }
+        }
+        resolver.resolve(episode)
+    }
 
-    /** 依次尝试多条线路，返回第一个可解析的剧集地址 */
+    /** 依次尝试多条线路，返回第一个可用的剧集地址 */
     suspend fun resolveWithFallback(drama: Drama, episodeIndex: Int): Pair<PlayGroup?, Resolved> {
         val sorted = drama.playGroups.sortedByDescending { it.episodes.size }
         var lastMessage = "无可用线路"
         for (g in sorted) {
             val ep = g.episodes.getOrNull(episodeIndex - 1) ?: continue
-            when (val r = resolver.resolve(ep)) {
+            when (val r = resolveEpisode(ep)) {
                 is Resolved.Direct -> return g to r
                 is Resolved.Failed -> lastMessage = r.message
             }
