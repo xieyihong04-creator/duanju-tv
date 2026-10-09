@@ -68,6 +68,7 @@ keyPassword=<口令>
 - `DataLayerTest`（18）：macCMS 编码解析、剧集排序、分享页还原、进度持久化原子性
 - `HotRankerTest`（6）：本地热度打分与排序稳定性
 - `LiveNetworkTest`（2）：打真实服务器，验证内置源能拿到可播 m3u8、聚合搜索有结果
+  - 依赖源站可用性与出口 IP（机房 IP 常被 403），CI 用 `-PskipLiveNetworkTests` 跳过，本地默认执行
 
 ## 已知限制
 

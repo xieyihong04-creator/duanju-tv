@@ -75,6 +75,14 @@ android {
         unitTests.isReturnDefaultValues = true
     }
 
+    // 真机网络用例依赖第三方 CMS 源可用性；CI 出口 IP 常被源站 403，用 -PskipLiveNetworkTests 显式跳过
+    tasks.withType<Test>().configureEach {
+        if (project.hasProperty("skipLiveNetworkTests")) {
+            filter.excludeTestsMatching("*LiveNetworkTest")
+            filter.isFailOnNoMatchingTests = false
+        }
+    }
+
     applicationVariants.all {
         val variant = this
         variant.outputs.forEach { o ->

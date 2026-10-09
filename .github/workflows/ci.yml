@@ -20,7 +20,8 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Unit tests
-        run: ./gradlew --no-daemon :app:testDebugUnitTest
+        # -PskipLiveNetworkTests：第三方 CMS 源会 403 机房 IP，live 用例仅在本地跑
+        run: ./gradlew --no-daemon :app:testDebugUnitTest -PskipLiveNetworkTests
 
       - name: Assemble release
         # CI 无签名凭据，产出未签名 APK；本地配置 keystore.properties 后为已签名版本
