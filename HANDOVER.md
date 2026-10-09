@@ -98,3 +98,25 @@ keystore 只存在于 CI Secrets，工作区没有 `.jks`；未配置凭据时 `
   取流为无扩展名 mp4 直链，HTTP 200 可播。
 - 未做：把 v1.1.1 装到真机回归（无设备），播放器实际起播由 CI 之外的手动验证覆盖。
 
+## 仓库已转公开（2026-10-09）
+
+`https://github.com/xieyihong04-creator/duanju-tv` 现为 **public**（原 private，0 fork/0 star 转换前）。
+转公开前对**全部 15 个提交**做过密钥扫描，结果：
+
+- 提交内容里没有任何 `ghp_` / `github_pat_` 串，token 只存在于本机 `.git/config` 的 remote URL（不入库、不公开）。
+- 从未提交过 `keystore.properties` / `local.properties` / `*.jks`；仓库里只有 `.example` 空模板，
+  `.gitignore` 已覆盖这些路径。
+- CI 只用 `${{ secrets.* }}` 引用，不回显密钥值。
+
+公开后需注意（都属可接受，但别忽略）：
+
+1. **本文件（HANDOVER.md）本身是公开的**，其中写了三个 Secret 的名字与别名 `duanju-tv`、
+   红果 App 签名通道逆向细节、以及「token 曾泄漏在聊天记录」这件事。密钥值没写，
+   但这等于把攻击面清单交给外人 —— 若在意，删掉本文件或移到私有 issue/wiki。
+2. **提交元数据里含真实邮箱**：早期提交的 author 填的是学校邮箱（非 GitHub noreply），
+   公开后会被爬虫采集。介意的话需改写历史（`git filter-repo`）+ 强推，或之后用
+   `用户名@users.noreply.github.com` 作为 author。
+3. Secrets 本身对协作者不可读（Actions 运行时才注入），公开仓库不影响其保密性；
+   但**任何人都能对自己的 fork 触发 workflow**，若将来加 `pull_request_target` 之类事件要小心。
+4. 待办第 1 条仍然成立且更紧急：那枚明文 token 现在是公开仓库的 owner 凭据，请尽快 revoke。
+
