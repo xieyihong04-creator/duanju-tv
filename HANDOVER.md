@@ -1,11 +1,16 @@
-# 交接文档（duanju-tv 红果源 + v1.1.0 发布）
+# 交接文档（duanju-tv 红果源 + v1.1.1 发布）
 
 ## 仓库
-- 本地：`/tmp/opencode/duanju-tv`（GitHub 私有库 clone）
-- 参考：`/tmp/opencode/guoapp`（public，红果 provider Go 实现，hongguo 共 13 个文件）
-- 主分支 `main`，当前 tag `v1.1.0`，GitHub Release 带正式签名 APK
+- 本次工作区：`/data/duanju-tv`（GitHub 私有库 clone，main 已推送到 `7e5a530` + `e87293f`，tag `v1.1.1`）
+- 上一手工作区：`/tmp/opencode/duanju-tv`（已不存在，仅历史路径）
+- 参考：`/tmp/opencode/guoapp`（public，红果 provider Go 实现，hongguo 共 13 个文件；本次未依赖其存在）
+- 主分支 `main`，最新 tag **`v1.1.1`**，GitHub Release 带正式签名 APK（CI #4 success，apksigner 验签通过）
+- 历史 tag：`v1.0.0`、`v1.1.0`（v1.1.0 的 App 通道实际不可用，见下）
 
 ## 本次交付（v1.1.0）
+> 注：v1.1.0 写的「App 优先、网页兜底」实际只有网页兜底生效 ——
+> App 通道当时因序列化 bug 100% 不可用，修复见下方 2026-10-09 章节（v1.1.1）。
+
 红果源双通道，App 优先、网页兜底：
 - `HongguoSign.kt` — X-Gorgon 签名（逐字节对 Go `sign.go`，golden 单测覆盖）
 - `HongguoAppClient.kt` — landpage 目录 / video_detail 详情 / video_model 取流（只留明流）
@@ -16,18 +21,22 @@
 - `.github/workflows/release.yml` — tag `v*` 触发：单测 → assembleRelease → apksigner 验签 → 建 Release
 
 ## 发布流程
-`git tag vX.Y.Z && git push origin vX.Y.Z` 即触发。依赖 3 个 Secrets：
+`git tag -a vX.Y.Z && git push origin main vX.Y.Z` 即触发。依赖 3 个 Secrets：
 `KEYSTORE_BASE64` / `KEYSTORE_STORE_PASSWORD` / `KEYSTORE_KEY_ALIAS(=duanju-tv)`。
-签名配置读 `DJ_` 环境变量（见 `app/build.gradle.kts`），versionCode=2 / versionName=1.1.0。
+签名配置读 `DJ_` 环境变量（见 `app/build.gradle.kts`）。
+当前 **versionCode=3 / versionName=1.1.1**；Release 正文写死在 `release.yml` 的
+`gh release create --notes`，换版本记得同步改（本次已改成 v1.1.1 的实际内容）。
+keystore 只存在于 CI Secrets，工作区没有 `.jks`；未配置凭据时 `assembleRelease` 产未签名包。
 
 ## ⚠️ 待办（按优先级）
-1. **revoke 聊天记录里的新 token**（明文，repo+workflow 权限）— 只能在 GitHub 网页端操作，Agent 无法代做
-2. **备份 keystore**：`/tmp/duanju-release.jks` + 密码（`/tmp/dj-storepass.txt`）只在本机 tmp，重启即失；
-   丢了后续升级须换包名。当前工作区里这两个文件都不存在，只能从 GitHub Secrets 取回
-   （`KEYSTORE_BASE64` / `KEYSTORE_STORE_PASSWORD` / `KEYSTORE_KEY_ALIAS` 仍在仓库配置里），
-   或用已有签名 APK 反推公钥信息不可行 —— 请务必先确认 keystore 是否还有别处副本
-3. ~~App 通道翻页是坑~~ **已修（见下）**
-4. CENC 加密流只过滤不解密；djapi 第三方通道已放弃
+1. **revoke 聊天记录里的 token**（`ghp_…`，明文，repo+workflow 权限）— 只能在 GitHub 网页端操作，Agent 无法代做。
+   另注意 `origin` 的 remote URL 里嵌着这枚明文 token（`git remote -v` 可见），换新 token 时一并改 remote 或改用凭据存储。
+2. **备份 keystore**：`/tmp/duanju-release.jks` + 密码（`/tmp/dj-storepass.txt`）只在上台机器 tmp，现已丢失；
+   当前工作区同样不存在这两个文件。**好消息**：v1.1.1 由 CI 成功签出，说明 Secrets 里的 keystore 仍可用，
+   可从 `KEYSTORE_BASE64` 导出后离线备份（`base64 -d > release.jks` + `keytool -list` 验证）。
+   丢了后续升级须换包名 —— 请尽快落实。
+3. ~~App 通道翻页是坑~~ **已修并发布（见下，v1.1.1）**
+4. CENC 加密流只过滤不解密；djapi 第三方通道已放弃（两项均属已接受限制）
 
 ## 2026-10-09 修复（红果通道整体可用性）
 
@@ -76,4 +85,16 @@
 ./gradlew :app:testDebugUnitTest -PskipLiveNetworkTests   # 64 个离线用例
 ./gradlew :app:testDebugUnitTest --tests '*LiveNetworkTest'  # 需联网，验证真实接口
 ```
+
+## 发布记录（v1.1.1，2026-10-09）
+
+- 提交：`7e5a530`（上述修复）→ `e87293f`（versionCode 3 / versionName 1.1.1 + Release 正文），均已推 `origin/main`
+- CI（push main 触发）：run success，真实 runner 下 64 离线用例通过
+- tag：`v1.1.1`（annotated，内容为修复清单），Release #4 **completed / success**
+- Release：<https://github.com/xieyihong04-creator/duanju-tv/releases/tag/v1.1.1>
+  - 资产 `DuanjuTV-release-1.1.1.apk`（12,215,626 B，CI 内 apksigner 验签通过 = 正式签名）
+- 真机端到端实测（2026-10-09 于沙箱出口 IP）：
+  `page1=16 条 channel=app` → `page2=18 条 overlap=0`；「牌下深渊」补 38 集；
+  取流为无扩展名 mp4 直链，HTTP 200 可播。
+- 未做：把 v1.1.1 装到真机回归（无设备），播放器实际起播由 CI 之外的手动验证覆盖。
 
