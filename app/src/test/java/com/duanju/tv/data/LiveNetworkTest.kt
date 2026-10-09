@@ -5,6 +5,9 @@ import com.duanju.tv.data.model.Resolved
 import com.duanju.tv.data.remote.CmsClient
 import com.duanju.tv.data.remote.DefaultSources
 import com.duanju.tv.data.remote.DramaRepository
+import com.duanju.tv.data.remote.HongguoAppClient
+import com.duanju.tv.data.remote.HongguoClient
+import com.duanju.tv.data.remote.HongguoSign
 import com.duanju.tv.data.remote.SharePageResolver
 import com.duanju.tv.data.remote.SourceSpec
 import com.duanju.tv.data.remote.buildOkHttp
@@ -25,7 +28,12 @@ class LiveNetworkTest {
 
     private val http = buildOkHttp()
     private val cms = CmsClient(http)
-    private val repo = DramaRepository(cms, SharePageResolver(http))
+    private val repo = DramaRepository(
+        cms,
+        SharePageResolver(http),
+        HongguoClient(http),
+        HongguoAppClient(http, HongguoSign.newDeviceId()),
+    )
 
     private fun online(): Boolean = runCatching {
         val c = java.net.Socket().apply { connect(java.net.InetSocketAddress("8.8.8.8", 53), 2000); close() }
