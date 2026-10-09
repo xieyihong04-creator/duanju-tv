@@ -98,6 +98,26 @@ object HongguoSign {
     fun stub(bodyBytes: ByteArray): String =
         bytesToHex(MessageDigest.getInstance("MD5").digest(bodyBytes)).uppercase()
 
+    /**
+     * 生成红果 device_id（对应 Go provider_hongguo_sign.go:15-21 newHongguoDeviceID）
+     * 返回 19 位数字字符串，范围 [1000000000000000000, 9000000000000000000)
+     */
+    fun newDeviceId(): String {
+        val random = ByteArray(8)
+        try {
+            java.security.SecureRandom().nextBytes(random)
+        } catch (_: Exception) {
+            // 兜底：时间戳纳秒
+            return System.nanoTime().toString()
+        }
+        val uint64 = java.nio.ByteBuffer.wrap(random).order(java.nio.ByteOrder.BIG_ENDIAN).long
+        val base = 1_000_000_000_000_000_000L
+        val range = 8_000_000_000_000_000_000L
+        // 使用无符号运算避免溢出
+        val result = (base.toULong() + (uint64.toULong() % range.toULong())).toString()
+        return result
+    }
+
     // ===== 工具函数 =====
 
     private fun rotateLeft8(b: Byte, n: Int): Byte {

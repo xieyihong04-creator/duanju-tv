@@ -371,6 +371,7 @@ class DramaRepository(
     private val cms: CmsClient,
     private val resolver: SharePageResolver,
     private val hongguo: HongguoClient,
+    private val hongguoApp: HongguoAppClient,
 ) {
 
     private companion object {
@@ -392,7 +393,29 @@ class DramaRepository(
 
     private suspend fun singlePage(spec: SourceSpec, page: Int): SearchPage {
         return when (spec.kind) {
-            SourceKind.HONGGUO -> hongguo.page(page)
+            SourceKind.HONGGUO -> {
+                // App 通道优先：landpage(cursor)，cursor 用 page 编码（首页 page=1 传 null）
+                val cursor = if (page == 1) null else page.toString()
+                try {
+                    val (dramas, nextCursor) = hongguoApp.landpage(cursor)
+                    if (dramas.isNotEmpty()) {
+                        SearchPage(
+                            items = dramas,
+                            page = page,
+                            pageCount = if (nextCursor != null) page + 1 else page,
+                            total = dramas.size,
+                        )
+                    } else {
+                        // App 返回空，回退网页版
+                        android.util.Log.w("DramaRepository", "红果 App landpage 返回空，回退网页版 page=$page")
+                        hongguo.page(page)
+                    }
+                } catch (e: Exception) {
+                    // App 失败，回退网页版
+                    android.util.Log.w("DramaRepository", "红果 App landpage 失败: ${e.message}，回退网页版 page=$page")
+                    hongguo.page(page)
+                }
+            }
             SourceKind.MAC_CMS -> {
                 val cats = dramaCategoryIds(spec)
                 if (cats.isEmpty()) cms.latest(spec, page)
@@ -446,7 +469,11 @@ class DramaRepository(
         withContext(Dispatchers.IO) {
             if (!spec.isAggregate) {
                 return@withContext when (spec.kind) {
-                    SourceKind.HONGGUO -> hongguo.search(keyword, page)
+                    SourceKind.HONGGUO -> {
+                        // 红果 App 搜索暂不支持，回退网页版
+                        android.util.Log.w("DramaRepository", "红果 App 搜索暂不支持，回退网页版 keyword=$keyword page=$page")
+                        hongguo.search(keyword, page)
+                    }
                     SourceKind.MAC_CMS -> {
                         val cats = dramaCategoryIds(spec)
                         val remote = runCatching { cms.search(spec, keyword, page) }.getOrNull()
@@ -504,14 +531,23 @@ class DramaRepository(
     }
 
     suspend fun resolveEpisode(episode: Episode): Resolved = withContext(Dispatchers.IO) {
-        // hongguo://series/vid 格式走 HongguoClient，其它走 SharePageResolver
+        // hongguo://series/vid 格式：App 通道优先，失败回退网页版
         if (episode.rawUrl.startsWith("hongguo://")) {
             val parts = episode.rawUrl.removePrefix("hongguo://").split("/")
             if (parts.size == 2) {
+                val seriesId = parts[0]
+                val vid = parts[1]
+                // 先尝试 App 通道 videoModel
                 try {
-                    return@withContext hongguo.resolve(parts[0], parts[1])
+                    return@withContext hongguoApp.videoModel(seriesId, vid)
                 } catch (e: IOException) {
-                    return@withContext Resolved.Failed(e.message ?: "红果解析失败")
+                    android.util.Log.w("DramaRepository", "红果 App videoModel 失败: ${e.message}，回退网页版 resolve seriesId=$seriesId vid=$vid")
+                    // 回退网页版
+                    try {
+                        return@withContext hongguo.resolve(seriesId, vid)
+                    } catch (e2: IOException) {
+                        return@withContext Resolved.Failed(e2.message ?: "红果解析失败")
+                    }
                 }
             }
         }

@@ -6,7 +6,9 @@ import com.duanju.tv.data.local.LocalStore
 import com.duanju.tv.data.media.PlayerFactory
 import com.duanju.tv.data.remote.CmsClient
 import com.duanju.tv.data.remote.DramaRepository
+import com.duanju.tv.data.remote.HongguoAppClient
 import com.duanju.tv.data.remote.HongguoClient
+import com.duanju.tv.data.remote.HongguoSign
 import com.duanju.tv.data.remote.SharePageResolver
 import com.duanju.tv.data.remote.buildOkHttp
 import okhttp3.Cache
@@ -43,9 +45,21 @@ class AppGraph(context: Context) {
 
     val hongguo: HongguoClient = HongguoClient(http)
 
-    val repository: DramaRepository = DramaRepository(cms, resolver, hongguo)
+    /** 红果 App 通道：优先使用，失败回退网页版 */
+    val hongguoApp: HongguoAppClient = HongguoAppClient(http, getOrCreateDeviceId())
+
+    val repository: DramaRepository = DramaRepository(cms, resolver, hongguo, hongguoApp)
 
     val playerFactory: PlayerFactory = PlayerFactory(context)
+
+    /** 从 LocalStore 读取或生成并持久化红果 device_id */
+    private fun getOrCreateDeviceId(): String {
+        val current = store.currentSettings.hongguoDeviceId
+        if (current.isNotBlank()) return current
+        val newId = HongguoSign.newDeviceId()
+        store.updateSettings { it.copy(hongguoDeviceId = newId) }
+        return newId
+    }
 }
 
 fun Context.appGraph(): AppGraph = (applicationContext as App).graph

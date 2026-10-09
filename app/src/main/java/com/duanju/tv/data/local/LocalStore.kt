@@ -31,6 +31,8 @@ data class Settings(
     val showSourceBadge: Boolean = true,
     /** 最近搜索词，最多 8 条 */
     val recentKeywords: List<String> = emptyList(),
+    /** 红果 App 通道 device_id（19 位数字字符串），首次生成后持久化 */
+    val hongguoDeviceId: String = "",
 )
 
 /**
@@ -51,6 +53,8 @@ class LocalStore private constructor(context: Context) {
 
     private val _settings = MutableStateFlowOf(Settings())
     val settings = _settings.flow
+    /** 当前设置值（同步读取） */
+    val currentSettings: Settings get() = _settings.value
 
     init {
         io.execute {
